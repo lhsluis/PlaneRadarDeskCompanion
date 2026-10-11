@@ -417,6 +417,7 @@ struct FlightUI {
   bool valid;
   char flight[16], iata[16], airline[8], type[8], desc[48];
   char org[16], dst[16], orgLine[112], dstLine[112], city[64];
+  char alt[16], dist[16];            // altitude (ft) e distância (NM) já formatadas
 };
 static SemaphoreHandle_t gMtx;
 static FlightUI gFlight;  static bool gFlightDirty = false;
@@ -556,6 +557,20 @@ static void fetchFlight() {
   strlcpy(f.org, orgCode[0] ? orgCode : "Indisponível", sizeof f.org);
   strlcpy(f.dst, dstCode[0] ? dstCode : "Indisponível", sizeof f.dst);
 
+  // altitude (alt_baro, em ft) e distância (dst, em NM)
+  f.alt[0] = 0; f.dist[0] = 0;
+  {
+    JsonVariantConst ab = ac["alt_baro"];
+    if (ab.is<const char*>()) strlcpy(f.alt, "Solo", sizeof f.alt);          // alt_baro vem como "ground" em solo
+    else if (ab.is<float>()) {
+      int ft = (int)ab.as<float>();
+      if (ft >= 1000)   snprintf(f.alt, sizeof f.alt, "%d.%03d ft", ft / 1000, ft % 1000);
+      else if (ft >= 0) snprintf(f.alt, sizeof f.alt, "%d ft", ft);
+    }
+    JsonVariantConst dv = ac["dst"];
+    if (dv.is<float>()) snprintf(f.dist, sizeof f.dist, "%.1f NM", dv.as<float>());
+  }
+
   if (org.isNull() || !orgCode[0]) strlcpy(f.orgLine, "Rota desconhecida", sizeof f.orgLine);
   else snprintf(f.orgLine, sizeof f.orgLine, "%s" SEP "%s" SEP "%s" SEP "%s", f.org,
                 S(org["name"], ""), S(org["municipality"], ""), S(org["country_name"], ""));
@@ -671,6 +686,7 @@ static void netTask(void*) {
 static lv_obj_t *lblTitle, *lblTime, *lblDate, *lblCity, *imgWx, *lblTemp, *lblCond;
 static lv_obj_t *lblFlight, *lblIata, *lblType, *lblDesc, *lblOrg, *lblDst, *lblOrgLine, *lblDstLine;
 static lv_obj_t *imgLogo, *lblLogoTxt, *imgSil, *imgRadar;
+static lv_obj_t *lblAlt, *lblDist;
 static lv_img_dsc_t dscLogo, dscSil;
 static uint8_t* uiLogoBuf = nullptr;
 static SvgImg uiSil = {nullptr, 0, 0};
@@ -773,7 +789,15 @@ static void buildUI() {
   lv_obj_t* cr = mkBox(fc, 248, 8, 44, 44, LV_RADIUS_CIRCLE, 0x103834, 1, 0x24655A);
   imgSil = lv_img_create(cr);
   lv_obj_add_flag(imgSil, LV_OBJ_FLAG_HIDDEN);
-  imgRadar = lv_gif_create(cr);
+  // O GIF é um quadrado 40x40; este contêiner redondo recorta os cantos para o radar ficar circular
+  lv_obj_t* rc = lv_obj_create(cr);
+  lv_obj_remove_style_all(rc);
+  lv_obj_set_size(rc, 40, 40);
+  lv_obj_set_style_radius(rc, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_clip_corner(rc, true, 0);
+  lv_obj_clear_flag(rc, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_center(rc);
+  imgRadar = lv_gif_create(rc);
   lv_obj_add_flag(imgRadar, LV_OBJ_FLAG_HIDDEN);
   lv_obj_center(imgRadar);
 
@@ -798,6 +822,15 @@ static void buildUI() {
   lblDst = mkLabel(fc, F14, C_WHITE, "---");
   lv_obj_set_width(lblDst, 88); lv_label_set_long_mode(lblDst, LV_LABEL_LONG_CLIP);
   lv_obj_set_pos(lblDst, 184, 80);
+
+  // altitude à esquerda da rota e distância à direita (fonte menor, mesma linha dos códigos)
+  lblAlt = mkLabel(fc, F10, C_MUTED, "");
+  lv_obj_set_width(lblAlt, 66); lv_label_set_long_mode(lblAlt, LV_LABEL_LONG_CLIP);
+  lv_obj_set_style_text_align(lblAlt, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_obj_set_pos(lblAlt, 6, 82);
+  lblDist = mkLabel(fc, F10, C_MUTED, "");
+  lv_obj_set_width(lblDist, 66); lv_label_set_long_mode(lblDist, LV_LABEL_LONG_CLIP);
+  lv_obj_set_pos(lblDist, 226, 82);
 
   // detalhe da rota (formato da imagem 2)
   lblOrgLine = mkLabel(fc, F10, C_ROUTE, "");
@@ -856,6 +889,7 @@ static void applyUpdates() {
       lv_label_set_text(lblFlight, "--");  lv_label_set_text(lblIata, "");
       lv_label_set_text(lblType, "--");    lv_label_set_text(lblDesc, "");
       lv_label_set_text(lblOrg, "---");    lv_label_set_text(lblDst, "---");
+      lv_label_set_text(lblAlt, "");       lv_label_set_text(lblDist, "");   // sem voo: nada de altitude/distância
       lv_label_set_text(lblOrgLine, pt("Rastreando...").c_str());
       lv_label_set_text(lblDstLine, pt("Rota indisponível").c_str());
       lv_label_set_text(lblLogoTxt, "");
@@ -866,6 +900,8 @@ static void applyUpdates() {
       lv_label_set_text(lblFlight, f.flight);   lv_label_set_text(lblIata, f.iata);
       lv_label_set_text(lblType, f.type);       lv_label_set_text(lblDesc, f.desc);
       lv_label_set_text(lblOrg, f.org);         lv_label_set_text(lblDst, f.dst);
+      lv_label_set_text(lblAlt,  strlen(f.org) <= 4 ? f.alt  : "");   // com "Indisponível" não há espaço ao lado
+      lv_label_set_text(lblDist, strlen(f.dst) <= 4 ? f.dist : "");
       lv_label_set_text(lblOrgLine, f.orgLine); lv_label_set_text(lblDstLine, f.dstLine);
       lv_label_set_text(lblCity, f.city);
       if (lv_obj_has_flag(imgLogo, LV_OBJ_FLAG_HIDDEN)) lv_label_set_text(lblLogoTxt, f.airline);
