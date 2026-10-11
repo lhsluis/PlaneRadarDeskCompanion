@@ -1,0 +1,11 @@
+lat=-21.805684
+lon=-48.139653
+dist=10
+wfname=dummy_wifi
+wfpass=dummy123
+wheaterpooling=1800
+flighpooling=15
+urlbase=[YOUR BASE URL FROM PlaneRadar APP]
+tz=WET0WEST,M3.5.0/1,M10.5.0/2
+sleeptimer=22:30
+wakeuptimer=08:30
