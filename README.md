@@ -57,7 +57,8 @@ disponibilizados na pasta `FREENOVE`, junto com o manual do fabricante
 - `lv_conf.h`.
 
 O Arduino/ESP32 já fornece `WiFi`, `WiFiClientSecure`, `HTTPClient`, `SD_MMC`,
-`SPI` e `time`; essas APIs não precisam ser instaladas separadamente.
+`SPI`, `time`, `WebServer`, `Update` e `ESPmDNS`; essas APIs não precisam ser
+instaladas separadamente.
 
 ## Configuração do LVGL
 
@@ -85,7 +86,11 @@ valores para `libraries/lv_conf.h`:
 
 ## Placa (Arduino IDE)
 - ESP32S3 Dev Module; se a sua CYD-S3 tem PSRAM, habilite (OPI/QSPI conforme o módulo).
-- Partition Scheme com app maior (ex.: "Huge APP" ou 16MB), pois WiFi+TLS+LVGL passam de 1,3 MB.
+- Partition Scheme com suporte a OTA e app maior (por exemplo, uma opção
+  `Default ... with OTA` ou equivalente para flash de 16 MB), pois
+  WiFi+TLS+LVGL passam de 1,3 MB. **Não use `Huge APP`** se quiser atualizar
+  pelo navegador: essa opção não possui partição OTA neste projeto. Depois de
+  mudar o esquema, a primeira gravação deve ser feita por USB.
 
 ## Pinos e orientação
 
@@ -102,7 +107,7 @@ Se as cores estiverem trocadas, ajuste `PANEL_INVERT` e `PANEL_RGB_ORDER`.
 ## Cartão SD
 Copie `param.txt` e `radar.gif` para a raiz do cartão (FAT32). O `radar.gif` é exibido
 enquanto a busca não encontra aeronaves. Use a URL **base** em `urlbase` (sem `/api/...`); o código monta
-`/api/nearest-aircraft?lat=..&lon=..&dist=..`. Chaves aceitas: `lat lon dist wfname wfpass wheaterpooling flighpooling urlbase tz sleeptimer wakeuptimer`.
+`/api/nearest-aircraft?lat=..&lon=..&dist=..`. Chaves aceitas: `lat lon dist wfname wfpass wheaterpooling flighpooling urlbase tz sleeptimer wakeuptimer otauser otapass otahost`.
 
 `sleeptimer` e `wakeuptimer` definem o período de descanso no formato 24 horas (`HH:MM`).
 Durante esse período, a consulta de voos é suspensa e o backlight é reduzido ao mínimo.
@@ -154,6 +159,66 @@ tz=AEST-10AEDT,M10.1.0/2,M4.1.0/3
 Use a regra de horário de verão correspondente ao país. As coordenadas `lat` e `lon` continuam
 sendo usadas para clima e busca de aeronaves, mas não alteram o fuso configurado.
 
+## Página web de configuração e atualização
+
+Quando `otapass` existe no `param.txt` **e** a placa possui uma partição OTA, o
+Desk Companion inicia uma página web acessível por:
+
+```text
+http://planeradarcompanion.local/
+http://<IP-da-placa>/
+```
+
+O endereço IP é informado no Serial. O nome mDNS pode não funcionar em alguns
+dispositivos Android ou redes; nesse caso, use o IP. A página é protegida por
+HTTP Basic Authentication com as credenciais `otauser` e `otapass` e não usa
+criptografia. Use esse recurso somente em uma rede local confiável.
+
+Se `otapass` não existir ou não houver uma partição OTA, a página não é iniciada;
+o Serial informa a condição e o restante do firmware continua funcionando
+normalmente.
+
+### Configuração pelo navegador
+
+O formulário exibe as variáveis do `param.txt` organizadas nos blocos
+**Localização**, **Servidor de voos**, **Wi-Fi**, **Horário e tela** e **Acesso**.
+As senhas nunca são enviadas ao navegador: a interface apenas informa se existe
+uma senha. Deixe um campo de senha vazio para manter o valor atual. Não é
+possível apagar uma senha pela página; para deixar a rede ou o acesso OTA sem
+senha, edite o `param.txt` diretamente no cartão SD.
+
+Antes de salvar, o aparelho valida latitude/longitude, distância entre 1 e
+1000, URL `http`/`https`, intervalos, horários `HH:MM` e nome mDNS contendo
+somente letras, números e hífen. Os horários `sleeptimer` e `wakeuptimer` devem
+ser informados juntos ou ambos deixados vazios. Quebras de linha são removidas.
+
+Ao salvar, o firmware preserva comentários e chaves desconhecidas, grava
+primeiro em `param.tmp`, mantém `param.bak` como backup e restaura o backup se
+a troca falhar. Em seguida, reinicia a placa; a tela exibe
+`REINICIANDO...`.
+
+### Atualização OTA do firmware
+
+Para atualizar o firmware pelo navegador:
+
+1. No Arduino IDE, use **Sketch > Exportar binário compilado**.
+2. Envie na página o arquivo `*.ino.bin` gerado para o sketch.
+3. **Não** envie os arquivos que contêm `bootloader`, `partitions` ou `merged`
+   no nome.
+
+Durante a gravação, o progresso aparece no título da tela como
+`ATUALIZANDO xx%` e as buscas de rede são pausadas. Não há rollback
+automático: um binário inválido exige recuperação por USB. Depois de alterar o
+**Partition Scheme**, a primeira gravação precisa ser feita por USB; as
+atualizações seguintes podem usar OTA.
+
+As rotas HTTP disponíveis são:
+
+- `GET /` — página web de configuração e OTA;
+- `GET /config.json` — configuração sem os valores das senhas;
+- `POST /config` — valida e salva a configuração;
+- `POST /update` — grava o firmware enviado.
+
 ## Acentos (Á, ã, ç…)
 As fontes embutidas do LVGL só têm ASCII; por padrão o código remove os acentos ("Sábado" -> "Sabado").
 Para acentos de verdade: gere 5 fontes (10, 12, 14, 32, 48 px) com `lv_font_conv` incluindo
@@ -166,3 +231,14 @@ nomeie `font_ui_10` ... `font_ui_48` e ponha `USE_CUSTOM_FONTS 1`. O fonte do Fi
 - Logo PNG: só baixa quando a companhia muda; decodificado e reduzido no próprio ESP32 com PNGdec.
 - Silhueta SVG: rasterizada no próprio ESP32 com nanosvg para o tamanho configurado em `ICON_PX`, pintada na cor de destaque.
 - HTTPS usa `setInsecure()` (sem validar certificado).
+
+## Limitações conhecidas
+
+- Salvar um Wi-Fi incorreto pela página pode deixar a placa inacessível. Corrija
+  o `param.txt` ou restaure o `param.bak` pelo cartão SD.
+- O parse de SVG muito grande pode demorar vários segundos e manter a task de
+  rede ocupada; isso só ocorre quando o modelo da aeronave é trocado.
+- Logos PNG fora dos limites do PNGdec são substituídos pelo texto do código
+  ICAO da companhia.
+- Gravar ou escrever na flash pode causar uma pequena engasgada na interface
+  durante o OTA.

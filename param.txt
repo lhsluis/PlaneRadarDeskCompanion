@@ -1,11 +1,16 @@
-lat=-21.805684
-lon=-48.139653
-dist=10
+lat=41.179989
+lon=-8.671834
+dist=50
 wfname=dummy_wifi
 wfpass=dummy123
 wheaterpooling=1800
 flighpooling=15
 urlbase=[YOUR BASE URL FROM PlaneRadar APP]
 tz=WET0WEST,M3.5.0/1,M10.5.0/2
+# tela apagada entre sleeptimer e wakeuptimer (HH:MM); deixe vazio para nunca apagar
 sleeptimer=22:30
 wakeuptimer=08:30
+# OTA pelo navegador (só liga se otapass existir)
+otauser=admin
+otapass=troque_esta_senha
+otahost=planeradarcompanion

@@ -10,6 +10,10 @@
 #include <HTTPClient.h>
 #include <SPI.h>
 #include <SD_MMC.h>
+#include <WebServer.h>      // atualização OTA pelo navegador
+#include <Update.h>
+#include <ESPmDNS.h>
+#include <esp_ota_ops.h>
 #include <time.h>
 #include <ArduinoJson.h>
 #define LV_CONF_INCLUDE_SIMPLE
@@ -17,6 +21,7 @@
 #include <LovyanGFX.hpp>
 #include <PNGdec.h>          // biblioteca "PNGdec" (Larry Bank)
 #include "dashboard_types.h"
+#include "ota_page.h"
 
 #define NANOSVG_IMPLEMENTATION
 #include "nanosvg.h"
@@ -121,6 +126,7 @@ struct Params {
   String ssid, pass, urlbase;
   String tz = "WET0WEST,M3.5.0/1,M10.5.0/2";     // Portugal
   String sleepTimer, wakeupTimer;
+  String otaUser = "admin", otaPass, otaHost = "cyd-flights";   // OTA só liga se otapass estiver definido
   uint32_t weatherMs = 1800000UL, flightMs = 15000UL;
 } P;
 
@@ -161,6 +167,9 @@ static bool loadParams() {
     else if (k == "wfpass") P.pass = v;
     else if (k == "urlbase") P.urlbase = cleanUrl(v);
     else if (k == "tz") P.tz = v;
+    else if (k == "otauser") P.otaUser = v;
+    else if (k == "otapass") P.otaPass = v;
+    else if (k == "otahost") P.otaHost = v;
     else if (k == "sleeptimer") P.sleepTimer = v;
     else if (k == "wakeuptimer") P.wakeupTimer = v;
     else if (k == "wheaterpooling" || k == "weatherpooling") P.weatherMs = max(60L, v.toInt()) * 1000UL;
@@ -535,6 +544,18 @@ static void fetchFlight() {
   if (deserializeJson(doc, body)) { Serial.println("JSON invalido"); return; }
 
   FlightUI f; memset(&f, 0, sizeof f);
+
+  // Localização (cidade - estado/país): a API devolve sempre, inclusive quando não há aeronave
+  JsonObject loc = doc["location"].as<JsonObject>();
+  {
+    const char* city = S(loc["city"], ""), *sub = S(loc["principalsubdivision"], ""), *country = S(loc["countryname"], "");
+    if (*city || *country) {
+      if (*sub) snprintf(f.city, sizeof f.city, "%s - %s/%s", city, sub, country);
+      else      snprintf(f.city, sizeof f.city, "%s/%s", city, country);
+      plainInPlace(f.city);
+    }
+  }
+
   JsonObject ac = doc["aircraft"].as<JsonObject>();
   if (ac.isNull()) {
     f.valid = false;
@@ -545,7 +566,6 @@ static void fetchFlight() {
   JsonObject fi  = doc["flight_info"].as<JsonObject>();
   JsonObject org = fi["origin"].as<JsonObject>();
   JsonObject dst = fi["destination"].as<JsonObject>();
-  JsonObject loc = doc["location"].as<JsonObject>();
 
   strlcpy(f.flight,  S(ac["flight"], "---"), sizeof f.flight);  trimInPlace(f.flight);
   strlcpy(f.iata,    S(fi["callsign_iata"], ""), sizeof f.iata);
@@ -578,12 +598,8 @@ static void fetchFlight() {
   else snprintf(f.dstLine, sizeof f.dstLine, "%s" SEP "%s" SEP "%s" SEP "%s", f.dst,
                 S(dst["name"], ""), S(dst["municipality"], ""), S(dst["country_name"], ""));
 
-  const char* sub = S(loc["principalsubdivision"], "");
-  if (*sub) snprintf(f.city, sizeof f.city, "%s - %s/%s", S(loc["city"], ""), sub, S(loc["countryname"], ""));
-  else      snprintf(f.city, sizeof f.city, "%s/%s", S(loc["city"], ""), S(loc["countryname"], ""));
-
   plainInPlace(f.flight); plainInPlace(f.iata); plainInPlace(f.desc);
-  plainInPlace(f.orgLine); plainInPlace(f.dstLine); plainInPlace(f.city);
+  plainInPlace(f.orgLine); plainInPlace(f.dstLine);
 
   // Prefere as versões leves servidas pela API (se existirem); senão usa os campos originais.
   String logoUrl = S(doc["airline_logo_small"], S(doc["airline_logo"], ""));
@@ -660,10 +676,271 @@ static void fetchWeather() {
   xSemaphoreGive(gMtx);
 }
 
+// =====================================================================
+//  OTA pelo navegador:  http://<ip-ou-otahost.local>/   (usuário/senha do param.txt)
+//  Roda numa task própria (core 0, prioridade 0). A UI só lê gOtaPct para mostrar o progresso.
+// =====================================================================
+static volatile bool gOtaBusy = false;     // pausa as buscas de rede enquanto grava o firmware
+static volatile int  gOtaPct  = -1;        // -1 inativo | 0..99 progresso | 101 concluído | 102 erro
+static WebServer otaServer(80);
+static bool otaAuthed = false;
+static bool otaUpdateReady = false;
+static size_t otaBytes = 0, otaTotal = 0;
+
+// (a página HTML está em ota_page.h)
+
+static void otaUploadHandler() {
+  HTTPUpload& up = otaServer.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    otaAuthed = otaServer.authenticate(P.otaUser.c_str(), P.otaPass.c_str());
+    if (!otaAuthed) return;
+    gOtaBusy = true; gOtaPct = 0; otaBytes = 0;
+    otaUpdateReady = false;
+    otaTotal = otaServer.header("Content-Length").toInt();
+    Serial.printf("[ota] inicio: %s (%u bytes)\n", up.filename.c_str(), (unsigned)otaTotal);
+    otaUpdateReady = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+    if (!otaUpdateReady) {
+      Update.printError(Serial);
+      gOtaPct = 102;
+      gOtaBusy = false;
+    }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!otaAuthed || !otaUpdateReady) return;
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+      Update.printError(Serial);
+      otaUpdateReady = false;
+      gOtaPct = 102;
+      gOtaBusy = false;
+      Update.abort();
+      return;
+    }
+    otaBytes += up.currentSize;
+    if (otaTotal > 0) { int p = (int)((uint64_t)otaBytes * 100 / otaTotal); gOtaPct = p > 99 ? 99 : p; }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!otaAuthed || !otaUpdateReady) return;
+    if (Update.end(true)) Serial.printf("[ota] concluido: %u bytes\n", (unsigned)up.totalSize);
+    else {
+      Update.printError(Serial);
+      otaUpdateReady = false;
+      gOtaPct = 102;
+      gOtaBusy = false;
+    }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    if (otaAuthed && otaUpdateReady) { Update.abort(); Serial.println("[ota] abortado"); }
+    otaUpdateReady = false;
+    gOtaBusy = false; gOtaPct = -1;
+  }
+}
+
+static void otaFinishHandler() {
+  if (!otaAuthed) { otaServer.requestAuthentication(); return; }
+  bool ok = otaAuthed && otaUpdateReady && !Update.hasError();
+  otaServer.sendHeader("Connection", "close");
+  otaServer.send(ok ? 200 : 500, "text/plain", ok ? "OK" : Update.errorString());
+  if (ok) { gOtaPct = 101; vTaskDelay(pdMS_TO_TICKS(800)); ESP.restart(); }
+  else    { gOtaPct = 102; gOtaBusy = false; otaUpdateReady = false; }
+}
+
+
+// ---------------------------------------------------------------------
+//  Configuração do param.txt pela página web
+// ---------------------------------------------------------------------
+struct CfgField { const char* key; const char* alias; bool secret; };
+static const CfgField CFG[] = {
+  {"lat", nullptr, false}, {"lon", nullptr, false}, {"dist", nullptr, false},
+  {"urlbase", nullptr, false},
+  {"flighpooling", "flightpooling", false}, {"wheaterpooling", "weatherpooling", false},
+  {"wfname", nullptr, false}, {"wfpass", nullptr, true},
+  {"tz", nullptr, false}, {"sleeptimer", nullptr, false}, {"wakeuptimer", nullptr, false},
+  {"otauser", nullptr, false}, {"otapass", nullptr, true}, {"otahost", nullptr, false},
+};
+static const int CFG_N = sizeof(CFG) / sizeof(CFG[0]);
+
+static bool otaCheckAuth() {
+  if (otaServer.authenticate(P.otaUser.c_str(), P.otaPass.c_str())) return true;
+  otaServer.requestAuthentication();
+  return false;
+}
+
+// Chave da linha "chave=valor" (minúscula, sem espaços); "" se não for linha de configuração
+static String cfgLineKey(String line) {
+  line.trim();
+  if (!line.length() || line[0] == '#') return "";
+  int eq = line.indexOf('=');
+  if (eq < 0) return "";
+  String k = line.substring(0, eq); k.trim(); k.toLowerCase();
+  return k;
+}
+static int cfgIndexOfKey(const String& k) {
+  for (int i = 0; i < CFG_N; i++)
+    if (k == CFG[i].key || (CFG[i].alias && k == CFG[i].alias)) return i;
+  return -1;
+}
+static String readTextFile(const char* path) {
+  String s; File f = SD_MMC.open(path);
+  if (f) { s = f.readString(); f.close(); }
+  return s;
+}
+// Valor padrão (da configuração em uso) quando a chave não está no arquivo
+static String cfgDefault(const char* key) {
+  String k = key;
+  if (k == "lat") return String(P.lat, 6);
+  if (k == "lon") return String(P.lon, 6);
+  if (k == "dist") return String(P.dist);
+  if (k == "urlbase") return P.urlbase;
+  if (k == "flighpooling") return String(P.flightMs / 1000UL);
+  if (k == "wheaterpooling") return String(P.weatherMs / 1000UL);
+  if (k == "wfname") return P.ssid;
+  if (k == "tz") return P.tz;
+  if (k == "sleeptimer") return P.sleepTimer;
+  if (k == "wakeuptimer") return P.wakeupTimer;
+  if (k == "otauser") return P.otaUser;
+  if (k == "otahost") return P.otaHost;
+  return "";
+}
+
+static void cfgGetHandler() {
+  if (!otaCheckAuth()) return;
+  String txt = readTextFile("/param.txt");
+  String vals[CFG_N]; bool found[CFG_N];
+  for (int i = 0; i < CFG_N; i++) found[i] = false;
+  int pos = 0;
+  while (pos <= (int)txt.length()) {
+    int nl = txt.indexOf('\n', pos); if (nl < 0) nl = txt.length();
+    String line = txt.substring(pos, nl); pos = nl + 1;
+    String k = cfgLineKey(line); if (!k.length()) continue;
+    int i = cfgIndexOfKey(k); if (i < 0) continue;
+    String v = line.substring(line.indexOf('=') + 1); v.trim();
+    vals[i] = v; found[i] = true;
+  }
+  JsonDocument doc;
+  for (int i = 0; i < CFG_N; i++) {
+    String v = found[i] ? vals[i] : cfgDefault(CFG[i].key);
+    if (CFG[i].secret) doc[String(CFG[i].key) + "_set"] = (v.length() > 0);   // a senha NUNCA vai para o navegador
+    else doc[CFG[i].key] = v;
+  }
+  String out; serializeJson(doc, out);
+  otaServer.sendHeader("Cache-Control", "no-store");
+  otaServer.send(200, "application/json", out);
+}
+
+static String cfgClean(String v, size_t maxLen) {      // remove quebras de linha (evita injetar outras chaves)
+  v.replace("\r", ""); v.replace("\n", ""); v.trim();
+  if (v.length() > maxLen) v = v.substring(0, maxLen);
+  return v;
+}
+static bool isNumber(const String& v, bool allowDot) {
+  if (!v.length()) return false;
+  int dots = 0; bool digit = false;
+  for (size_t i = 0; i < v.length(); i++) {
+    char c = v[i];
+    if (c == '-' && i == 0) continue;
+    if (allowDot && c == '.' && ++dots == 1) continue;
+    if (c < '0' || c > '9') return false;
+    digit = true;
+  }
+  return digit;
+}
+// Retorna "" se tudo estiver válido; senão a mensagem de erro
+static String cfgValidate(const String v[]) {
+  auto at = [&](const char* key) -> const String& { for (int i = 0; i < CFG_N; i++) if (!strcmp(CFG[i].key, key)) return v[i]; return v[0]; };
+  uint16_t m;
+  if (!isNumber(at("lat"), true) || at("lat").toFloat() < -90 || at("lat").toFloat() > 90) return "Latitude inválida (-90 a 90)";
+  if (!isNumber(at("lon"), true) || at("lon").toFloat() < -180 || at("lon").toFloat() > 180) return "Longitude inválida (-180 a 180)";
+  if (!isNumber(at("dist"), false) || at("dist").toInt() < 1 || at("dist").toInt() > 1000) return "Raio de busca inválido (1 a 1000)";
+  if (!(at("urlbase").startsWith("http://") || at("urlbase").startsWith("https://"))) return "URL base deve começar com http:// ou https://";
+  if (!isNumber(at("flighpooling"), false) || at("flighpooling").toInt() < 5 || at("flighpooling").toInt() > 3600) return "Intervalo de voos inválido (5 a 3600 s)";
+  if (!isNumber(at("wheaterpooling"), false) || at("wheaterpooling").toInt() < 60 || at("wheaterpooling").toInt() > 86400) return "Intervalo de clima inválido (60 a 86400 s)";
+  if (!at("wfname").length()) return "Informe o nome da rede Wi-Fi";
+  if (!at("tz").length()) return "Informe o fuso horário";
+  bool s = at("sleeptimer").length() > 0, w = at("wakeuptimer").length() > 0;
+  if ((s && !parseClock(at("sleeptimer"), m)) || (w && !parseClock(at("wakeuptimer"), m))) return "Horários devem estar no formato HH:MM";
+  if (s != w) return "Preencha os dois horários (apagar e acender) ou deixe ambos vazios";
+  if (!at("otauser").length()) return "Informe o usuário de acesso";
+  const String& h = at("otahost");
+  if (!h.length() || h.length() > 32) return "Nome na rede deve ter de 1 a 32 caracteres";
+  for (size_t i = 0; i < h.length(); i++) if (!isalnum((uint8_t)h[i]) && h[i] != '-') return "Nome na rede: apenas letras, números e hífen";
+  return "";
+}
+
+static void cfgPostHandler() {
+  if (!otaCheckAuth()) return;
+  String v[CFG_N];
+  for (int i = 0; i < CFG_N; i++) {
+    if (!CFG[i].secret && !otaServer.hasArg(CFG[i].key)) { otaServer.send(400, "text/plain", String("Campo ausente: ") + CFG[i].key); return; }
+    v[i] = cfgClean(otaServer.arg(CFG[i].key), CFG[i].key[0] == 'u' ? 200 : 96);       // urlbase até 200
+  }
+  String err = cfgValidate(v);
+  if (err.length()) { otaServer.send(400, "text/plain", err); return; }
+
+  // Reescreve o param.txt preservando comentários e chaves desconhecidas
+  String old = readTextFile("/param.txt"), out;
+  bool done[CFG_N]; for (int i = 0; i < CFG_N; i++) done[i] = false;
+  int pos = 0;
+  while (pos < (int)old.length()) {
+    int nl = old.indexOf('\n', pos); if (nl < 0) nl = old.length();
+    String line = old.substring(pos, nl); pos = nl + 1;
+    line.replace("\r", "");
+    String k = cfgLineKey(line);
+    int i = k.length() ? cfgIndexOfKey(k) : -1;
+    if (i >= 0 && !(CFG[i].secret && !v[i].length())) {           // senha vazia = mantém a linha como está
+      String keyAsWritten = line.substring(0, line.indexOf('=')); keyAsWritten.trim();
+      out += keyAsWritten + "=" + v[i] + "\n"; done[i] = true;
+    } else {
+      out += line + "\n"; if (i >= 0) done[i] = true;
+    }
+  }
+  for (int i = 0; i < CFG_N; i++)
+    if (!done[i] && !(CFG[i].secret && !v[i].length())) out += String(CFG[i].key) + "=" + v[i] + "\n";
+
+  // grava em arquivo temporário e troca (mantém param.bak como backup)
+  File f = SD_MMC.open("/param.tmp", FILE_WRITE);
+  if (!f) { otaServer.send(500, "text/plain", "Não foi possível abrir o cartão SD para escrita"); return; }
+  size_t wrote = f.print(out); f.close();
+  if (wrote != out.length()) { SD_MMC.remove("/param.tmp"); otaServer.send(500, "text/plain", "Falha ao gravar no cartão SD"); return; }
+  SD_MMC.remove("/param.bak");
+  if (SD_MMC.exists("/param.txt") && !SD_MMC.rename("/param.txt", "/param.bak")) { otaServer.send(500, "text/plain", "Falha ao criar backup"); return; }
+  if (!SD_MMC.rename("/param.tmp", "/param.txt")) {
+    SD_MMC.rename("/param.bak", "/param.txt");                     // restaura
+    otaServer.send(500, "text/plain", "Falha ao salvar; configuração anterior restaurada"); return;
+  }
+  Serial.println("[cfg] param.txt atualizado; reiniciando");
+  otaServer.send(200, "text/plain", "OK");
+  gOtaPct = 101;                                                   // mostra "REINICIANDO..." na tela
+  vTaskDelay(pdMS_TO_TICKS(800));
+  ESP.restart();
+}
+
+static void otaTask(void*) {
+  for (;;) { otaServer.handleClient(); vTaskDelay(pdMS_TO_TICKS(gOtaBusy ? 1 : 10)); }
+}
+
+static void startOta() {
+  if (!P.otaPass.length()) { Serial.println("[ota] desativado: defina otapass no param.txt"); return; }
+  if (!esp_ota_get_next_update_partition(NULL)) {
+    Serial.println("[ota] sem particao OTA: escolha um Partition Scheme com OTA (nao use 'Huge APP')");
+    return;
+  }
+  if (MDNS.begin(P.otaHost.c_str())) { MDNS.addService("http", "tcp", 80); Serial.printf("[ota] http://%s.local/\n", P.otaHost.c_str()); }
+  Serial.printf("[ota] http://%s/  (usuario: %s)\n", WiFi.localIP().toString().c_str(), P.otaUser.c_str());
+  static const char* hdrs[] = {"Content-Length"};
+  otaServer.collectHeaders(hdrs, 1);
+  otaServer.on("/", HTTP_GET, []() {
+    if (!otaServer.authenticate(P.otaUser.c_str(), P.otaPass.c_str())) { otaServer.requestAuthentication(); return; }
+    otaServer.send_P(200, "text/html", OTA_PAGE);
+  });
+  otaServer.on("/config.json", HTTP_GET, cfgGetHandler);
+  otaServer.on("/config", HTTP_POST, cfgPostHandler);
+  otaServer.on("/update", HTTP_POST, otaFinishHandler, otaUploadHandler);
+  otaServer.begin();
+  xTaskCreatePinnedToCore(otaTask, "ota", 8192, nullptr, 0, nullptr, 0);
+}
+
 static void netTask(void*) {
   bool doneF = false, doneW = false;
   uint32_t lastF = 0, lastW = 0, lastReconnect = 0;
   for (;;) {
+    if (gOtaBusy) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }   // não disputa o WiFi durante a atualização
     if (WiFi.status() != WL_CONNECTED) {
       if (millis() - lastReconnect > 10000) { lastReconnect = millis(); WiFi.disconnect(); WiFi.begin(P.ssid.c_str(), P.pass.c_str()); }
       vTaskDelay(pdMS_TO_TICKS(500)); continue;
@@ -841,6 +1118,19 @@ static void buildUI() {
   lv_obj_set_pos(lblDstLine, 12, 119);
 }
 
+// IP exibido por 10 s no título (mesmo lugar de "CONECTANDO WIFI...") assim que conecta
+static uint32_t ipShowUntil = 0;
+static void showIpTitle() {
+  lv_obj_set_style_text_letter_space(lblTitle, 0, 0);          // sem espaçamento extra: o IP é longo e a cidade fica logo à direita
+  lv_label_set_text_fmt(lblTitle, "IP %s", WiFi.localIP().toString().c_str());
+  ipShowUntil = millis() + 10000;
+}
+static void restoreTitle(const char* txt) {
+  lv_obj_set_style_text_letter_space(lblTitle, 2, 0);
+  lv_label_set_text(lblTitle, pt(txt).c_str());
+  ipShowUntil = 0;
+}
+
 static void setStatus(const char* msg) {
   lv_label_set_text(lblTitle, pt(msg).c_str());
   lv_timer_handler();
@@ -885,6 +1175,7 @@ static void applyUpdates() {
   }
 
   if (fd) {
+    if (f.city[0]) lv_label_set_text(lblCity, f.city);      // com ou sem voo
     if (!f.valid) {
       lv_label_set_text(lblFlight, "--");  lv_label_set_text(lblIata, "");
       lv_label_set_text(lblType, "--");    lv_label_set_text(lblDesc, "");
@@ -903,7 +1194,6 @@ static void applyUpdates() {
       lv_label_set_text(lblAlt,  strlen(f.org) <= 4 ? f.alt  : "");   // com "Indisponível" não há espaço ao lado
       lv_label_set_text(lblDist, strlen(f.dst) <= 4 ? f.dist : "");
       lv_label_set_text(lblOrgLine, f.orgLine); lv_label_set_text(lblDstLine, f.dstLine);
-      lv_label_set_text(lblCity, f.city);
       if (lv_obj_has_flag(imgLogo, LV_OBJ_FLAG_HIDDEN)) lv_label_set_text(lblLogoTxt, f.airline);
       lv_obj_add_flag(imgRadar, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1014,12 +1304,14 @@ void setup() {
   WiFi.begin(P.ssid.c_str(), P.pass.c_str());
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { lv_timer_handler(); delay(50); }
-  setStatus(WiFi.status() == WL_CONNECTED ? "HORÁRIO LOCAL" : "WIFI FALHOU (RETENTANDO)");
+  if (WiFi.status() == WL_CONNECTED) { showIpTitle(); lv_timer_handler(); }
+  else setStatus("WIFI FALHOU (RETENTANDO)");
 
   configTzTime(P.tz.c_str(), "pt.pool.ntp.org", "time.google.com");
   lv_timer_create(clockCb, 1000, nullptr);
   clockCb(nullptr);
 
+  startOta();
   xTaskCreatePinnedToCore(netTask, "net", 20480, nullptr, 0, nullptr, 0);   // prio 0: divide tempo com a idle task (parse de SVG grande demora)
 }
 
@@ -1032,9 +1324,26 @@ void loop() {
     wasSleeping = sleeping;
     tft.setBrightness(sleeping ? 1 : 255);
   }
+  // progresso do OTA no título (lido de gOtaPct; o LVGL só é tocado aqui)
+  static int lastOta = -1;
+  int ota = gOtaPct;
+  if (ota != lastOta) {
+    lastOta = ota;
+    if (ota >= 0 && ota <= 99)  lv_label_set_text_fmt(lblTitle, "ATUALIZANDO %d%%", ota);
+    else if (ota == 101)        lv_label_set_text(lblTitle, "REINICIANDO...");
+    else if (ota == 102)        lv_label_set_text(lblTitle, "FALHA NA ATUALIZACAO");
+  }
   // volta o título quando o WiFi reconecta
   static bool wasUp = true;
   bool up = WiFi.status() == WL_CONNECTED;
-  if (up != wasUp) { wasUp = up; lv_label_set_text(lblTitle, pt(up ? "HORÁRIO LOCAL" : "SEM WIFI").c_str()); }
+  if (up != wasUp) {
+    wasUp = up;
+    if (up) showIpTitle();                 // reconectou: mostra o IP por 10 s
+    else    restoreTitle("SEM WIFI");
+  }
+  // fim dos 10 s do IP: volta ao título normal (se não houver atualização OTA em andamento)
+  if (ipShowUntil && (int32_t)(millis() - ipShowUntil) >= 0) {
+    if (gOtaPct < 0) restoreTitle("HORÁRIO LOCAL"); else ipShowUntil = 0;
+  }
   delay(5);
 }
