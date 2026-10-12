@@ -50,6 +50,8 @@
 #define PANEL_INVERT    true
 #define PANEL_RGB_ORDER false
 #define COLOR_TEST      0   // 1 = barras Vermelho/Verde/Azul/Branco por 2,5 s no boot
+#define MEM_MIN_FREE    30000   // reinicia se a RAM interna livre ficar abaixo disso por 3 min seguidos
+#define MEM_MIN_BLOCK   8192    // ... ou se o maior bloco contínuo ficar abaixo disso (fragmentação)
 #define ICON_PX         34  // tamanho (px) do logo e da silhueta dentro dos círculos de 44 px
 
 // =====================================================================
@@ -684,7 +686,6 @@ static volatile bool gOtaBusy = false;     // pausa as buscas de rede enquanto g
 static volatile int  gOtaPct  = -1;        // -1 inativo | 0..99 progresso | 101 concluído | 102 erro
 static WebServer otaServer(80);
 static bool otaAuthed = false;
-static bool otaUpdateReady = false;
 static size_t otaBytes = 0, otaTotal = 0;
 
 // (a página HTML está em ota_page.h)
@@ -695,50 +696,31 @@ static void otaUploadHandler() {
     otaAuthed = otaServer.authenticate(P.otaUser.c_str(), P.otaPass.c_str());
     if (!otaAuthed) return;
     gOtaBusy = true; gOtaPct = 0; otaBytes = 0;
-    otaUpdateReady = false;
     otaTotal = otaServer.header("Content-Length").toInt();
     Serial.printf("[ota] inicio: %s (%u bytes)\n", up.filename.c_str(), (unsigned)otaTotal);
-    otaUpdateReady = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
-    if (!otaUpdateReady) {
-      Update.printError(Serial);
-      gOtaPct = 102;
-      gOtaBusy = false;
-    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) Update.printError(Serial);
   } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (!otaAuthed || !otaUpdateReady) return;
-    if (Update.write(up.buf, up.currentSize) != up.currentSize) {
-      Update.printError(Serial);
-      otaUpdateReady = false;
-      gOtaPct = 102;
-      gOtaBusy = false;
-      Update.abort();
-      return;
-    }
+    if (!otaAuthed) return;
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
     otaBytes += up.currentSize;
     if (otaTotal > 0) { int p = (int)((uint64_t)otaBytes * 100 / otaTotal); gOtaPct = p > 99 ? 99 : p; }
   } else if (up.status == UPLOAD_FILE_END) {
-    if (!otaAuthed || !otaUpdateReady) return;
+    if (!otaAuthed) return;
     if (Update.end(true)) Serial.printf("[ota] concluido: %u bytes\n", (unsigned)up.totalSize);
-    else {
-      Update.printError(Serial);
-      otaUpdateReady = false;
-      gOtaPct = 102;
-      gOtaBusy = false;
-    }
+    else Update.printError(Serial);
   } else if (up.status == UPLOAD_FILE_ABORTED) {
-    if (otaAuthed && otaUpdateReady) { Update.abort(); Serial.println("[ota] abortado"); }
-    otaUpdateReady = false;
+    if (otaAuthed) { Update.abort(); Serial.println("[ota] abortado"); }
     gOtaBusy = false; gOtaPct = -1;
   }
 }
 
 static void otaFinishHandler() {
   if (!otaAuthed) { otaServer.requestAuthentication(); return; }
-  bool ok = otaAuthed && otaUpdateReady && !Update.hasError();
+  bool ok = !Update.hasError();
   otaServer.sendHeader("Connection", "close");
   otaServer.send(ok ? 200 : 500, "text/plain", ok ? "OK" : Update.errorString());
   if (ok) { gOtaPct = 101; vTaskDelay(pdMS_TO_TICKS(800)); ESP.restart(); }
-  else    { gOtaPct = 102; gOtaBusy = false; otaUpdateReady = false; }
+  else    { gOtaPct = 102; gOtaBusy = false; }
 }
 
 
@@ -831,15 +813,14 @@ static String cfgClean(String v, size_t maxLen) {      // remove quebras de linh
 }
 static bool isNumber(const String& v, bool allowDot) {
   if (!v.length()) return false;
-  int dots = 0; bool digit = false;
+  int dots = 0;
   for (size_t i = 0; i < v.length(); i++) {
     char c = v[i];
     if (c == '-' && i == 0) continue;
     if (allowDot && c == '.' && ++dots == 1) continue;
     if (c < '0' || c > '9') return false;
-    digit = true;
   }
-  return digit;
+  return true;
 }
 // Retorna "" se tudo estiver válido; senão a mensagem de erro
 static String cfgValidate(const String v[]) {
@@ -858,7 +839,7 @@ static String cfgValidate(const String v[]) {
   if (s != w) return "Preencha os dois horários (apagar e acender) ou deixe ambos vazios";
   if (!at("otauser").length()) return "Informe o usuário de acesso";
   const String& h = at("otahost");
-  if (!h.length() || h.length() > 32) return "Nome na rede deve ter de 1 a 32 caracteres";
+  if (!h.length()) return "Informe o nome na rede";
   for (size_t i = 0; i < h.length(); i++) if (!isalnum((uint8_t)h[i]) && h[i] != '-') return "Nome na rede: apenas letras, números e hífen";
   return "";
 }
@@ -963,6 +944,37 @@ static void netTask(void*) {
 static lv_obj_t *lblTitle, *lblTime, *lblDate, *lblCity, *imgWx, *lblTemp, *lblCond;
 static lv_obj_t *lblFlight, *lblIata, *lblType, *lblDesc, *lblOrg, *lblDst, *lblOrgLine, *lblDstLine;
 static lv_obj_t *imgLogo, *lblLogoTxt, *imgSil, *imgRadar;
+
+// O lv_gif continua decodificando frames mesmo escondido (HIDDEN não pausa o timer dele).
+// Pausamos o timer enquanto o radar não está visível para não gerar leituras/alocações à toa.
+static void radarSet(bool on) {
+  lv_gif_t* g = (lv_gif_t*)imgRadar;
+  if (on) { lv_obj_clear_flag(imgRadar, LV_OBJ_FLAG_HIDDEN); if (g->timer) lv_timer_resume(g->timer); }
+  else    { lv_obj_add_flag(imgRadar, LV_OBJ_FLAG_HIDDEN);   if (g->timer) lv_timer_pause(g->timer); }
+}
+
+// Carrega o radar.gif do SD UMA vez para a memória (PSRAM) e anima a partir dela:
+// sem leituras contínuas do cartão durante horas.
+static lv_img_dsc_t radarDsc;
+static void loadRadarGif() {
+  File rf = SD_MMC.open("/radar.gif");
+  size_t n = rf ? rf.size() : 0;
+  uint8_t* buf = n ? (uint8_t*)heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : nullptr;
+  if (n && !buf) buf = (uint8_t*)malloc(n);
+  if (buf && rf.read(buf, n) == n) {
+    rf.close();
+    memset(&radarDsc, 0, sizeof radarDsc);
+    radarDsc.header.cf = LV_IMG_CF_RAW;
+    radarDsc.data = buf; radarDsc.data_size = n;
+    lv_gif_set_src(imgRadar, &radarDsc);
+    Serial.printf("[radar] GIF em memoria (%u bytes); sem leituras do SD em execucao\n", (unsigned)n);
+    return;
+  }
+  if (buf) free(buf);
+  if (rf) rf.close();
+  Serial.println("[radar] nao foi possivel carregar em memoria; lendo do SD");
+  lv_gif_set_src(imgRadar, "S:/radar.gif");
+}
 static lv_obj_t *lblAlt, *lblDist;
 static lv_img_dsc_t dscLogo, dscSil;
 static uint8_t* uiLogoBuf = nullptr;
@@ -1186,7 +1198,7 @@ static void applyUpdates() {
       lv_label_set_text(lblLogoTxt, "");
       lv_obj_add_flag(imgLogo, LV_OBJ_FLAG_HIDDEN);
       lv_obj_add_flag(imgSil, LV_OBJ_FLAG_HIDDEN);
-      lv_obj_clear_flag(imgRadar, LV_OBJ_FLAG_HIDDEN);
+      radarSet(true);
     } else {
       lv_label_set_text(lblFlight, f.flight);   lv_label_set_text(lblIata, f.iata);
       lv_label_set_text(lblType, f.type);       lv_label_set_text(lblDesc, f.desc);
@@ -1195,7 +1207,7 @@ static void applyUpdates() {
       lv_label_set_text(lblDist, strlen(f.dst) <= 4 ? f.dist : "");
       lv_label_set_text(lblOrgLine, f.orgLine); lv_label_set_text(lblDstLine, f.dstLine);
       if (lv_obj_has_flag(imgLogo, LV_OBJ_FLAG_HIDDEN)) lv_label_set_text(lblLogoTxt, f.airline);
-      lv_obj_add_flag(imgRadar, LV_OBJ_FLAG_HIDDEN);
+      radarSet(false);
     }
   }
 
@@ -1296,7 +1308,8 @@ void setup() {
   if (!SD_MMC.begin("/sdcard", false)) fatal("SEM CARTÃO SD");
   registerSdFs();
   if (!SD_MMC.exists("/radar.gif")) fatal("RADAR.GIF AUSENTE");
-  lv_gif_set_src(imgRadar, "S:/radar.gif");
+  loadRadarGif();
+  radarSet(false);                 // só anima enquanto estiver visível (sem voos)
   if (!loadParams()) fatal("PARAM.TXT INVÁLIDO");
 
   setStatus("CONECTANDO WIFI...");
@@ -1313,6 +1326,8 @@ void setup() {
 
   startOta();
   xTaskCreatePinnedToCore(netTask, "net", 20480, nullptr, 0, nullptr, 0);   // prio 0: divide tempo com a idle task (parse de SVG grande demora)
+
+  enableLoopWDT();                 // se o loop() travar por >5 s (ex.: assert do LVGL em while(1)), o aparelho reinicia sozinho
 }
 
 void loop() {
@@ -1323,6 +1338,18 @@ void loop() {
   if (sleeping != wasSleeping) {
     wasSleeping = sleeping;
     tft.setBrightness(sleeping ? 1 : 255);
+  }
+  // diagnóstico e autorrecuperação de memória (1x por minuto)
+  static uint32_t lastMem = 0; static int lowCount = 0;
+  if (millis() - lastMem >= 60000) {
+    lastMem = millis();
+    uint32_t freeInt = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t maxBlk  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    Serial.printf("[mem] interna livre=%u maior_bloco=%u minimo_historico=%u psram_livre=%u\n",
+                  (unsigned)freeInt, (unsigned)maxBlk, (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getFreePsram());
+    if (gOtaPct < 0 && (freeInt < MEM_MIN_FREE || maxBlk < MEM_MIN_BLOCK)) {
+      if (++lowCount >= 3) { Serial.println("[mem] memoria critica por 3 min -> reiniciando"); delay(200); ESP.restart(); }
+    } else lowCount = 0;
   }
   // progresso do OTA no título (lido de gOtaPct; o LVGL só é tocado aqui)
   static int lastOta = -1;
