@@ -8,8 +8,10 @@ O Desk Companion não é um servidor independente. Ele consulta a API da aplica�
 PlaneRadar pela rede Wi-Fi. Portanto, o PlaneRadar precisa estar **em execução,
 acessível e disponível na rede** para que o painel consiga consultar:
 
-<img width="801" height="511" alt="image" src="https://github.com/user-attachments/assets/9fe1f316-cd41-4b67-aa5e-2d1612b6b4c4" />
-<img width="903" height="545" alt="image" src="https://github.com/user-attachments/assets/7cf917cb-9d08-4844-be53-d37a7909425c" />
+| Aeronave mais Proxima  | Buscando               |
+| ---------------------- | ---------------------- |
+|<img width="801" height="511" alt="image" src="https://github.com/user-attachments/assets/9fe1f316-cd41-4b67-aa5e-2d1612b6b4c4" />|<img width="903" height="545" alt="image" src="https://github.com/user-attachments/assets/7cf917cb-9d08-4844-be53-d37a7909425c" />|
+
 
 ```text
 /api/nearest-aircraft?lat=..&lon=..&dist=..
