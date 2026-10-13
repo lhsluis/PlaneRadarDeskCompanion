@@ -28,9 +28,9 @@
 #define NANOSVGRAST_IMPLEMENTATION
 #include "nanosvgrast.h"
 
-// =====================================================================
-//  PINOS  (padrão = CYD clássico ESP32-2432S028R)  >>> CONFIRME NA SUA PLACA <<<
-// =====================================================================
+// ===================================================================================================
+//  PINOS  (padrão = Freenove ESP32-S3 Display 2.8" (ILI9341) FNK0104B)  >>> CONFIRME NA SUA PLACA <<<
+// ===================================================================================================
 #define TFT_SCLK_PIN 12
 #define TFT_MOSI_PIN 11
 #define TFT_MISO_PIN 13
@@ -129,7 +129,7 @@ struct Params {
   String ssid, pass, urlbase;
   String tz = "WET0WEST,M3.5.0/1,M10.5.0/2";     // Portugal
   String sleepTimer, wakeupTimer;
-  String otaUser = "admin", otaPass, otaHost = "cyd-flights";   // OTA só liga se otapass estiver definido
+  String otaUser = "admin", otaPass, otaHost = "planeradarcompanion";   // OTA só liga se otapass estiver definido
   uint32_t weatherMs = 1800000UL, flightMs = 15000UL;
 } P;
 
@@ -1360,6 +1360,7 @@ void setup() {
   tft.setBrightness(P.brightness);     // screenbrightness (padrão 255 se a chave não existir)
 
   setStatus("CONECTANDO WIFI...");
+  WiFi.setHostname(P.otaHost.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.begin(P.ssid.c_str(), P.pass.c_str());
   uint32_t t0 = millis();

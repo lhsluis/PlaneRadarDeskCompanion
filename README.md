@@ -93,7 +93,8 @@ copie `lv_conf.h` para o ../Arduino/libraries/lv_conf.h (Verifique na sua isntal
   WiFi+TLS+LVGL passam de 1,3 MB. **Não use `Huge APP`** se quiser atualizar
   pelo navegador: essa opção não possui partição OTA neste projeto. Depois de
   mudar o esquema, a primeira gravação deve ser feita por USB.
-
+  Partition testada e aprovada
+  `Partition Scheme: "16M Flash (3MB APP/9.9MB FATFS)"`
 ## Pinos e orientação
 
 O sketch está configurado para a Freenove FNK0104B. O bloco `PINOS` no topo do
