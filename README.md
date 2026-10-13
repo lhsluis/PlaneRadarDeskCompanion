@@ -66,6 +66,8 @@ O sketch inclui `cyd_flight_dashboard/lv_conf.h`, que já habilita GIF e PNG por
 padrão. Se a instalação do LVGL exigir uma configuração global, copie os mesmos
 valores para `libraries/lv_conf.h`:
 
+copie `lv_conf.h` para o ../Arduino/libraries/lv_conf.h (Verifique na sua isntalação onde são salvos as libraries baixadas pelo Arduino IDE), ao lado da pasta lvgl e não dentro dela
+
 ```c
 #if 1                                   // habilita o arquivo
 #define LV_COLOR_DEPTH 16

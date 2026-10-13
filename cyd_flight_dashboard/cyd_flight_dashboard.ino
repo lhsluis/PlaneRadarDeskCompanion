@@ -125,6 +125,7 @@ static LGFX tft;
 // =====================================================================
 struct Params {
   float lat = 0, lon = 0; int dist = 50;
+  int brightness = 255;                       // screenbrightness (0..255); sem a chave, mantém 255 como antes
   String ssid, pass, urlbase;
   String tz = "WET0WEST,M3.5.0/1,M10.5.0/2";     // Portugal
   String sleepTimer, wakeupTimer;
@@ -172,6 +173,7 @@ static bool loadParams() {
     else if (k == "otauser") P.otaUser = v;
     else if (k == "otapass") P.otaPass = v;
     else if (k == "otahost") P.otaHost = v;
+    else if (k == "screenbrightness") { long b = v.toInt(); if (b >= 0 && b <= 255 && (b > 0 || v == "0")) P.brightness = (int)b; }
     else if (k == "sleeptimer") P.sleepTimer = v;
     else if (k == "wakeuptimer") P.wakeupTimer = v;
     else if (k == "wheaterpooling" || k == "weatherpooling") P.weatherMs = max(60L, v.toInt()) * 1000UL;
@@ -733,7 +735,7 @@ static const CfgField CFG[] = {
   {"urlbase", nullptr, false},
   {"flighpooling", "flightpooling", false}, {"wheaterpooling", "weatherpooling", false},
   {"wfname", nullptr, false}, {"wfpass", nullptr, true},
-  {"tz", nullptr, false}, {"sleeptimer", nullptr, false}, {"wakeuptimer", nullptr, false},
+  {"tz", nullptr, false}, {"screenbrightness", nullptr, false}, {"sleeptimer", nullptr, false}, {"wakeuptimer", nullptr, false},
   {"otauser", nullptr, false}, {"otapass", nullptr, true}, {"otahost", nullptr, false},
 };
 static const int CFG_N = sizeof(CFG) / sizeof(CFG[0]);
@@ -774,6 +776,7 @@ static String cfgDefault(const char* key) {
   if (k == "wheaterpooling") return String(P.weatherMs / 1000UL);
   if (k == "wfname") return P.ssid;
   if (k == "tz") return P.tz;
+  if (k == "screenbrightness") return String(P.brightness);
   if (k == "sleeptimer") return P.sleepTimer;
   if (k == "wakeuptimer") return P.wakeupTimer;
   if (k == "otauser") return P.otaUser;
@@ -781,21 +784,35 @@ static String cfgDefault(const char* key) {
   return "";
 }
 
+// Parâmetros extras cujo nome sugere segredo nunca são enviados ao navegador
+static bool isSecretKey(String k) {
+  k.toLowerCase();
+  return k.indexOf("pass") >= 0 || k.indexOf("pwd") >= 0 || k.indexOf("senha") >= 0 ||
+         k.indexOf("secret") >= 0 || k.indexOf("token") >= 0 || k.indexOf("key") >= 0;
+}
+
 static void cfgGetHandler() {
   if (!otaCheckAuth()) return;
   String txt = readTextFile("/param.txt");
   String vals[CFG_N]; bool found[CFG_N];
   for (int i = 0; i < CFG_N; i++) found[i] = false;
+  JsonDocument doc;
+  JsonArray extras = doc["extras"].to<JsonArray>();
   int pos = 0;
   while (pos <= (int)txt.length()) {
     int nl = txt.indexOf('\n', pos); if (nl < 0) nl = txt.length();
     String line = txt.substring(pos, nl); pos = nl + 1;
+    line.replace("\r", "");
     String k = cfgLineKey(line); if (!k.length()) continue;
-    int i = cfgIndexOfKey(k); if (i < 0) continue;
-    String v = line.substring(line.indexOf('=') + 1); v.trim();
-    vals[i] = v; found[i] = true;
+    int eq = line.indexOf('=');
+    String v = line.substring(eq + 1); v.trim();
+    int i = cfgIndexOfKey(k);
+    if (i >= 0) { vals[i] = v; found[i] = true; continue; }
+    String keyAsWritten = line.substring(0, eq); keyAsWritten.trim();       // chave desconhecida -> parâmetro adicional
+    JsonObject o = extras.add<JsonObject>();
+    o["k"] = keyAsWritten;
+    if (isSecretKey(k)) o["s"] = true; else o["v"] = v;
   }
-  JsonDocument doc;
   for (int i = 0; i < CFG_N; i++) {
     String v = found[i] ? vals[i] : cfgDefault(CFG[i].key);
     if (CFG[i].secret) doc[String(CFG[i].key) + "_set"] = (v.length() > 0);   // a senha NUNCA vai para o navegador
@@ -834,6 +851,7 @@ static String cfgValidate(const String v[]) {
   if (!isNumber(at("wheaterpooling"), false) || at("wheaterpooling").toInt() < 60 || at("wheaterpooling").toInt() > 86400) return "Intervalo de clima inválido (60 a 86400 s)";
   if (!at("wfname").length()) return "Informe o nome da rede Wi-Fi";
   if (!at("tz").length()) return "Informe o fuso horário";
+  if (!isNumber(at("screenbrightness"), false) || at("screenbrightness").toInt() < 0 || at("screenbrightness").toInt() > 255) return "Brilho inválido (0 a 255)";
   bool s = at("sleeptimer").length() > 0, w = at("wakeuptimer").length() > 0;
   if ((s && !parseClock(at("sleeptimer"), m)) || (w && !parseClock(at("wakeuptimer"), m))) return "Horários devem estar no formato HH:MM";
   if (s != w) return "Preencha os dois horários (apagar e acender) ou deixe ambos vazios";
@@ -854,6 +872,22 @@ static void cfgPostHandler() {
   String err = cfgValidate(v);
   if (err.length()) { otaServer.send(400, "text/plain", err); return; }
 
+  // Parâmetros adicionais enviados pela página (ek<i>/ev<i>); xs=1 indica que a seção foi enviada
+  bool extrasSent = otaServer.hasArg("xs");
+  String ek[32], ev[32]; bool exDone[32]; int en = 0;
+  for (int i = 0; i < 32; i++) {
+    String nk = "ek" + String(i), nv = "ev" + String(i);
+    if (!otaServer.hasArg(nk)) continue;
+    String k = cfgClean(otaServer.arg(nk), 32); String val = cfgClean(otaServer.arg(nv), 200);
+    if (!k.length()) continue;
+    for (size_t c = 0; c < k.length(); c++)
+      if (!isalnum((uint8_t)k[c]) && k[c] != '_' && k[c] != '-') { otaServer.send(400, "text/plain", "Nome de parâmetro inválido: use letras, números, _ e -"); return; }
+    String kl = k; kl.toLowerCase();
+    if (cfgIndexOfKey(kl) >= 0) { otaServer.send(400, "text/plain", "O parâmetro '" + k + "' já existe no formulário acima"); return; }
+    for (int j = 0; j < en; j++) { String o = ek[j]; o.toLowerCase(); if (o == kl) { otaServer.send(400, "text/plain", "Parâmetro duplicado: " + k); return; } }
+    ek[en] = k; ev[en] = val; exDone[en] = false; en++;
+  }
+
   // Reescreve o param.txt preservando comentários e chaves desconhecidas
   String old = readTextFile("/param.txt"), out;
   bool done[CFG_N]; for (int i = 0; i < CFG_N; i++) done[i] = false;
@@ -864,6 +898,16 @@ static void cfgPostHandler() {
     line.replace("\r", "");
     String k = cfgLineKey(line);
     int i = k.length() ? cfgIndexOfKey(k) : -1;
+    if (k.length() && i < 0 && extrasSent) {                       // chave desconhecida = parâmetro adicional
+      int j = -1;
+      for (int t = 0; t < en; t++) { String o = ek[t]; o.toLowerCase(); if (o == k) { j = t; break; } }
+      if (j < 0 || exDone[j]) continue;                              // removido pelo usuário (ou linha repetida)
+      exDone[j] = true;
+      if (isSecretKey(k) && !ev[j].length()) { out += line + "\n"; continue; }   // segredo vazio = mantém
+      String keyAsWritten = line.substring(0, line.indexOf('=')); keyAsWritten.trim();
+      out += keyAsWritten + "=" + ev[j] + "\n";
+      continue;
+    }
     if (i >= 0 && !(CFG[i].secret && !v[i].length())) {           // senha vazia = mantém a linha como está
       String keyAsWritten = line.substring(0, line.indexOf('=')); keyAsWritten.trim();
       out += keyAsWritten + "=" + v[i] + "\n"; done[i] = true;
@@ -873,6 +917,8 @@ static void cfgPostHandler() {
   }
   for (int i = 0; i < CFG_N; i++)
     if (!done[i] && !(CFG[i].secret && !v[i].length())) out += String(CFG[i].key) + "=" + v[i] + "\n";
+  for (int j = 0; j < en; j++)                                        // parâmetros adicionais novos
+    if (!exDone[j] && !(isSecretKey(ek[j]) && !ev[j].length())) out += ek[j] + "=" + ev[j] + "\n";
 
   // grava em arquivo temporário e troca (mantém param.bak como backup)
   File f = SD_MMC.open("/param.tmp", FILE_WRITE);
@@ -1031,7 +1077,7 @@ static void buildUI() {
   lv_obj_set_pos(lblTime, 14, 17);
 
   lblDate = mkLabel(card, F12, C_MUTED, "");
-  lv_obj_set_pos(lblDate, 18, 62);
+  lv_obj_set_pos(lblDate, 18, 66);
 
   // ---- bloco clima (direita) ----
   lblCity = mkLabel(card, F10, 0xC5D6DB, "");
@@ -1311,6 +1357,7 @@ void setup() {
   loadRadarGif();
   radarSet(false);                 // só anima enquanto estiver visível (sem voos)
   if (!loadParams()) fatal("PARAM.TXT INVÁLIDO");
+  tft.setBrightness(P.brightness);     // screenbrightness (padrão 255 se a chave não existir)
 
   setStatus("CONECTANDO WIFI...");
   WiFi.mode(WIFI_STA);
@@ -1337,7 +1384,7 @@ void loop() {
   bool sleeping = isSleepTime();
   if (sleeping != wasSleeping) {
     wasSleeping = sleeping;
-    tft.setBrightness(sleeping ? 1 : 255);
+    tft.setBrightness(sleeping ? 1 : P.brightness);
   }
   // diagnóstico e autorrecuperação de memória (1x por minuto)
   static uint32_t lastMem = 0; static int lowCount = 0;
