@@ -10,7 +10,7 @@ acessível e disponível na rede** para que o painel consiga consultar:
 
 | Aeronave mais Proxima  | Buscando               |
 | ---------------------- | ---------------------- |
-|<img width="801" height="511" alt="image" src="https://github.com/user-attachments/assets/9fe1f316-cd41-4b67-aa5e-2d1612b6b4c4" />|<img width="903" height="545" alt="image" src="https://github.com/user-attachments/assets/7cf917cb-9d08-4844-be53-d37a7909425c" />|
+|<img width="801" height="511" alt="Aeronave mais Proxima" src="https://github.com/user-attachments/assets/9fe1f316-cd41-4b67-aa5e-2d1612b6b4c4" />|<img width="903" height="545" alt="Buscando" src="https://github.com/user-attachments/assets/7cf917cb-9d08-4844-be53-d37a7909425c" />|
 
 
 ```text
