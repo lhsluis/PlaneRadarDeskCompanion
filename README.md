@@ -59,6 +59,8 @@ disponibilizados na pasta `FREENOVE`, junto com o manual do fabricante
 - `nanosvg.h`;
 - `nanosvgrast.h`;
 - `dashboard_types.h`;
+- `debug_log.h`;
+- `debug_page.h`;
 - `lv_conf.h`.
 
 O Arduino/ESP32 já fornece `WiFi`, `WiFiClientSecure`, `HTTPClient`, `SD_MMC`,
@@ -67,9 +69,11 @@ instaladas separadamente.
 
 ## Configuração do LVGL
 
-O sketch inclui `cyd_flight_dashboard/lv_conf.h`, que já habilita GIF e PNG por
-padrão. Se a instalação do LVGL exigir uma configuração global, copie os mesmos
-valores para `libraries/lv_conf.h`:
+O sketch inclui `cyd_flight_dashboard/lv_conf.h`, que habilita GIF. O logo e as
+silhuetas PNG são processados pela biblioteca **PNGdec**, e não pelo decoder
+PNG do LVGL; por isso `LV_USE_PNG` pode permanecer desabilitado. Se a instalação
+do LVGL exigir uma configuração global, copie os mesmos valores para
+`libraries/lv_conf.h`:
 
 copie `lv_conf.h` para o ../Arduino/libraries/lv_conf.h (Verifique na sua isntalação onde são salvos as libraries baixadas pelo Arduino IDE), ao lado da pasta lvgl e não dentro dela
 
@@ -81,8 +85,8 @@ copie `lv_conf.h` para o ../Arduino/libraries/lv_conf.h (Verifique na sua isntal
 #define LV_TICK_CUSTOM 1
 #define LV_TICK_CUSTOM_INCLUDE "Arduino.h"
 #define LV_TICK_CUSTOM_SYS_TIME_EXPR (millis())
-#define LV_USE_PNG 1                    // decodifica o logo da companhia
-#define LV_USE_GIF 1                   // animação radar.gif durante a busca
+#define LV_USE_PNG 0                    // PNG é processado pela biblioteca PNGdec
+#define LV_USE_GIF 1                    // animação radar.gif durante a busca
 #define LV_IMG_CACHE_DEF_SIZE 1
 #define LV_FONT_MONTSERRAT_10 1
 #define LV_FONT_MONTSERRAT_12 1
@@ -106,16 +110,26 @@ O sketch está configurado para a Freenove FNK0104B. O bloco `PINOS` no topo do
 `.ino` contém os pinos do TFT, backlight e SDMMC. A orientação atual é definida por:
 
 ```cpp
-tft.setRotation(1);
+tft.setRotation(3);
 ```
 
-Para a orientação paisagem invertida, use `tft.setRotation(3)`.
+Se a tela ficar invertida, teste `tft.setRotation(1)`.
 Se as cores estiverem trocadas, ajuste `PANEL_INVERT` e `PANEL_RGB_ORDER`.
 
 ## Cartão SD
 Copie `param.txt` e `radar.gif` para a raiz do cartão (FAT32). O `radar.gif` é exibido
 enquanto a busca não encontra aeronaves. Use a URL **base** em `urlbase` (sem `/api/...`); o código monta
-`/api/nearest-aircraft?lat=..&lon=..&dist=..`. Chaves aceitas: `lat lon dist wfname wfpass wheaterpooling flighpooling urlbase tz sleeptimer wakeuptimer otauser otapass otahost`.
+`/api/nearest-aircraft?lat=..&lon=..&dist=..`. Chaves conhecidas: `lat lon dist wfname wfpass wheaterpooling flighpooling urlbase tz screenbrightness sleeptimer wakeuptimer otauser otapass otahost`.
+
+O parâmetro `screenbrightness` define o brilho normal da tela entre `0` e
+`255`. Durante o período de descanso, o firmware reduz o backlight para o
+mínimo e, ao acordar, restaura o valor configurado.
+
+Parâmetros desconhecidos também podem permanecer no arquivo. A página web os
+exibe na seção **Parâmetros adicionais** e permite editá-los ou removê-los sem
+perder comentários e chaves que o firmware ainda não utiliza. Parâmetros cujo
+nome sugere segredo (`pass`, `senha`, `key`, `token`, etc.) não têm o valor
+enviado ao navegador.
 
 `sleeptimer` e `wakeuptimer` definem o período de descanso no formato 24 horas (`HH:MM`).
 Durante esse período, a consulta de voos é suspensa e o backlight é reduzido ao mínimo.
@@ -189,7 +203,8 @@ normalmente.
 ### Configuração pelo navegador
 
 O formulário exibe as variáveis do `param.txt` organizadas nos blocos
-**Localização**, **Servidor de voos**, **Wi-Fi**, **Horário e tela** e **Acesso**.
+**Localização**, **Servidor de voos**, **Wi-Fi**, **Horário e tela**, **Acesso** e
+**Parâmetros adicionais**.
 As senhas nunca são enviadas ao navegador: a interface apenas informa se existe
 uma senha. Deixe um campo de senha vazio para manter o valor atual. Não é
 possível apagar uma senha pela página; para deixar a rede ou o acesso OTA sem
@@ -223,9 +238,20 @@ atualizações seguintes podem usar OTA.
 As rotas HTTP disponíveis são:
 
 - `GET /` — página web de configuração e OTA;
+- `GET /debug` — monitor de debug com a saída serial em tempo real;
+- `GET /debug/log?since=N` — leitura incremental do histórico serial;
 - `GET /config.json` — configuração sem os valores das senhas;
 - `POST /config` — valida e salva a configuração;
 - `POST /update` — grava o firmware enviado.
+
+O monitor é protegido pelas mesmas credenciais Basic Auth da página OTA e só
+fica disponível quando a página OTA é iniciada (senha `otapass` configurada e
+partição OTA presente). Ele mostra as mensagens que o sketch escreve via
+`Serial`, com tempo desde o boot; não inclui mensagens internas do ESP32 nem
+relatórios de crash. O histórico na placa usa um buffer circular de 32 KB com
+PSRAM ou 8 KB sem PSRAM e é perdido quando a placa reinicia. A página do
+navegador mantém os dados que já recebeu, permite pausar a consulta e baixá-los
+como arquivo `.txt`.
 
 ## Acentos (Á, ã, ç…)
 As fontes embutidas do LVGL só têm ASCII; por padrão o código remove os acentos ("Sábado" -> "Sabado").
@@ -237,7 +263,8 @@ nomeie `font_ui_10` ... `font_ui_48` e ponha `USE_CUSTOM_FONTS 1`. O fonte do Fi
 - Task de rede (core 0) busca voo a cada `flighpooling` s e clima (Open-Meteo, sem chave) a cada `wheaterpooling` s.
 - UI (core 1) só aplica os dados prontos — o LVGL nunca é tocado pela task de rede.
 - Logo PNG: só baixa quando a companhia muda; decodificado e reduzido no próprio ESP32 com PNGdec.
-- Silhueta SVG: rasterizada no próprio ESP32 com nanosvg para o tamanho configurado em `ICON_PX`, pintada na cor de destaque.
+- Silhueta SVG: rasterizada no próprio ESP32 com nanosvg para o tamanho configurado em `ICON_PX`, pintada na cor de destaque. Silhuetas PNG também são reduzidas pelo PNGdec; bitmaps vazios ou inválidos usam a silhueta genérica.
+- `radar.gif` é carregado uma vez em memória, preferencialmente na PSRAM, e o timer da animação é pausado quando o radar não está visível.
 - HTTPS usa `setInsecure()` (sem validar certificado).
 
 ## Limitações conhecidas
@@ -246,7 +273,7 @@ nomeie `font_ui_10` ... `font_ui_48` e ponha `USE_CUSTOM_FONTS 1`. O fonte do Fi
   o `param.txt` ou restaure o `param.bak` pelo cartão SD.
 - O parse de SVG muito grande pode demorar vários segundos e manter a task de
   rede ocupada; isso só ocorre quando o modelo da aeronave é trocado.
-- Logos PNG fora dos limites do PNGdec são substituídos pelo texto do código
-  ICAO da companhia.
+- Logos ou silhuetas PNG fora dos limites do PNGdec são substituídos pelo texto
+  do código ICAO da companhia ou pela silhueta genérica, respectivamente.
 - Gravar ou escrever na flash pode causar uma pequena engasgada na interface
   durante o OTA.
