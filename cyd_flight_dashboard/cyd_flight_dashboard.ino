@@ -452,6 +452,7 @@ struct FlightUI {
   char org[16], dst[16], orgLine[112], dstLine[112], city[64];
   char alt[16], dist[16];            // altitude (ft) e distância (NM) já formatadas
   char airlineName[40];              // flight_info.airline.name
+  bool showLogo, showSil;            // logo/silhueta JÁ carregados para este voo (mesma URL): só reexibir, sem novo download
 };
 static SemaphoreHandle_t gMtx;
 static FlightUI gFlight;  static bool gFlightDirty = false;
@@ -476,11 +477,12 @@ static void pushSil(const SvgImg& s) {
 // =====================================================================
 //  HTTP
 // =====================================================================
+static uint16_t gHttpReadMs = 8000;     // tempo de leitura do HTTP (maior para imagens: o servidor pode gerar na 1ª vez)
 static bool gHttpTooBig = false;   // true quando o servidor respondeu 200 mas o arquivo excede o limite
 static bool httpGet(const String& url, String& out, size_t maxLen) {
   gHttpTooBig = false;
   WiFiClientSecure sc; WiFiClient pc; HTTPClient http;
-  http.setConnectTimeout(6000); http.setTimeout(8000);
+  http.setConnectTimeout(6000); http.setTimeout(gHttpReadMs);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   bool ok;
   if (url.startsWith("https")) { sc.setInsecure(); ok = http.begin(sc, url); }
@@ -502,13 +504,20 @@ static bool httpGet(const String& url, String& out, size_t maxLen) {
 // A API devolve links de imagem em http:// mesmo servindo a API em https://.
 // O HTTPClient não segue redirecionamento http->https com cliente não-seguro; por isso tentamos https primeiro.
 static bool httpGetImg(const String& url, String& out, size_t maxLen) {
+  gHttpReadMs = 10000;                          // imagens: 10 s (antes 8 s; 20 s deixava a netTask bloqueada demais)
+  bool r;
   if (url.startsWith("http://") && P.urlbase.startsWith("https://")) {
     String up = "https://" + url.substring(7);
-    if (httpGet(up, out, maxLen)) return true;
-    if (gHttpTooBig) return false;            // o arquivo existe mas é grande demais: http não ajuda
-    Serial.println("[img] https falhou, tentando http original");
+    r = httpGet(up, out, maxLen);
+    if (!r && !gHttpTooBig) {                   // (se for grande demais, http também não ajuda)
+      Serial.println("[img] https falhou, tentando http original");
+      r = httpGet(url, out, maxLen);
+    }
+  } else {
+    r = httpGet(url, out, maxLen);
   }
-  return httpGet(url, out, maxLen);
+  gHttpReadMs = 8000;
+  return r;
 }
 
 // Baixa para um buffer terminado em NUL, usando PSRAM quando existir (não duplica na RAM).
@@ -516,7 +525,7 @@ static bool httpGetImg(const String& url, String& out, size_t maxLen) {
 static bool httpGetBuf(const String& url, uint8_t** out, size_t* outLen, size_t maxLen) {
   *out = nullptr; *outLen = 0; gHttpTooBig = false;
   WiFiClientSecure sc; WiFiClient pc; HTTPClient http;
-  http.setConnectTimeout(6000); http.setTimeout(12000);
+  http.setConnectTimeout(6000); http.setTimeout(10000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   bool ok;
   if (url.startsWith("https")) { sc.setInsecure(); ok = http.begin(sc, url); }
@@ -526,7 +535,19 @@ static bool httpGetBuf(const String& url, uint8_t** out, size_t* outLen, size_t 
   int sz = http.getSize();
   Serial.printf("[http] %d  %s  (len=%d, heap=%u, psram=%u)\n", code, url.c_str(), sz,
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
-  if (code != 200 || sz <= 0) { http.end(); return false; }
+  if (code != 200) { http.end(); return false; }
+  if (sz <= 0) {                                    // sem Content-Length (resposta em blocos/chunked): getString() decodifica
+    String body = http.getString(); http.end();
+    size_t bl = body.length();
+    if (!bl) return false;
+    if (bl > maxLen) { Serial.printf("[http] arquivo de %u bytes excede o limite de %u\n", (unsigned)bl, (unsigned)maxLen); gHttpTooBig = true; return false; }
+    uint8_t* b = (uint8_t*)heap_caps_malloc(bl + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!b) b = (uint8_t*)malloc(bl + 1);
+    if (!b) { Serial.println("[http] sem memoria para o arquivo"); return false; }
+    memcpy(b, body.c_str(), bl); b[bl] = 0; *out = b; *outLen = bl;
+    Serial.printf("[http] resposta sem Content-Length: %u bytes\n", (unsigned)bl);
+    return true;
+  }
   if ((size_t)sz > maxLen) {
     Serial.printf("[http] arquivo de %d bytes excede o limite de %u\n", sz, (unsigned)maxLen);
     gHttpTooBig = true; http.end(); return false;
@@ -635,58 +656,82 @@ static void fetchFlight() {
   String logoUrl = S(doc["airline_logo_small"], S(doc["airline_logo"], ""));
   String silUrl  = S(doc["silhouette_png"], S(doc["silhouette"], ""));
 
+  f.showLogo = logoUrl.length() && logoUrl == lastLogoUrl;        // já temos o bitmap desta URL
+  f.showSil  = silLoaded && silUrl == lastSilUrl;
   xSemaphoreTake(gMtx, portMAX_DELAY); gFlight = f; gFlightDirty = true; xSemaphoreGive(gMtx);
 
-  Serial.printf("[flight] %s | logo=%s | sil=%s\n", f.flight, logoUrl.c_str(), silUrl.c_str());
-  static int logoTries = 0, silTries = 0;
+  Serial.printf("[flight] %s | logo=%s | sil=%s | em cache: logo=%d sil=%d\n", f.flight, logoUrl.c_str(), silUrl.c_str(), (int)f.showLogo, (int)f.showSil);
+  // Tentativas com espera (3 vezes a cada 15 s, depois 1 a cada 5 min) em vez de desistir de vez:
+  // uma falha passageira (rede, memória, servidor ainda gerando a imagem) não deixa o fallback para sempre.
+  static String logoFailUrl, silFailUrl;
+  static int logoFails = 0, silFails = 0;
+  static uint32_t logoRetryAt = 0, silRetryAt = 0;
 
   // ---- logo da companhia (PNG, reduzido durante a decodificação) — só baixa quando muda ----
   if (logoUrl != lastLogoUrl) {
-    SvgImg im = {nullptr, 0, 0}; bool ok = false;
-    if (logoUrl.length()) {
-      String img;
-      if (httpGetImg(logoUrl, img, 65536) && img.length() > 33 && !memcmp(img.c_str(), "\x89PNG", 4)) {
-        const uint8_t* p = (const uint8_t*)img.c_str();
-        uint32_t pw = be32(p + 16), ph = be32(p + 20);
-        ok = decodePngScaled(p, img.length(), ICON_PX, false, lv_color_black(), im);
-        Serial.printf("[logo] PNG %lux%lu, %u bytes -> %s (%dx%d), heap=%u\n", pw, ph, (unsigned)img.length(),
-                      ok ? "OK" : "FALHOU", im.w, im.h, (unsigned)ESP.getFreeHeap());
-      } else Serial.println("[logo] download falhou ou nao e PNG");
+    if (logoUrl != logoFailUrl) { logoFailUrl = logoUrl; logoFails = 0; logoRetryAt = 0; }   // URL nova: zera o backoff
+    if ((int32_t)(millis() - logoRetryAt) >= 0) {
+      SvgImg im = {nullptr, 0, 0}; bool ok = false;
+      if (logoUrl.length()) {
+        String img;
+        if (httpGetImg(logoUrl, img, 65536) && img.length() > 33 && !memcmp(img.c_str(), "\x89PNG", 4)) {
+          const uint8_t* p = (const uint8_t*)img.c_str();
+          uint32_t pw = be32(p + 16), ph = be32(p + 20);
+          ok = decodePngScaled(p, img.length(), ICON_PX, false, lv_color_black(), im);
+          Serial.printf("[logo] PNG %lux%lu, %u bytes -> %s (%dx%d), heap=%u\n", pw, ph, (unsigned)img.length(),
+                        ok ? "OK" : "FALHOU", im.w, im.h, (unsigned)ESP.getFreeHeap());
+        } else Serial.println("[logo] download falhou ou nao e PNG");
+      }
+      pushLogo(im.data, 0, im.w, im.h);
+      if (ok || !logoUrl.length()) { lastLogoUrl = logoUrl; logoFails = 0; }
+      else {
+        logoFails++;
+        uint32_t wait = logoFails <= 3 ? 15000UL : 300000UL;   // 3 tentativas a cada 15 s, depois 1 a cada 5 min
+        logoRetryAt = millis() + wait;
+        Serial.printf("[logo] falhou (%d); nova tentativa em %lu s\n", logoFails, (unsigned long)(wait / 1000));
+      }
     }
-    pushLogo(im.data, 0, im.w, im.h);
-    if (ok || !logoUrl.length() || ++logoTries >= 3) { lastLogoUrl = logoUrl; logoTries = 0; }
   }
 
   // ---- silhueta (SVG -> bitmap); se falhar, usa a silhueta genérica ----
   if (!silLoaded || silUrl != lastSilUrl) {
-    SvgImg im = {nullptr, 0, 0}; bool remoteOk = false;
-    if (silUrl.length()) {
-      uint8_t* raw = nullptr; size_t rawLen = 0;
-      size_t silMax = psramFound() ? 6UL * 1024 * 1024 : 120000UL;   // com PSRAM aceita SVG grande
-      if (httpGetImgBuf(silUrl, &raw, &rawLen, silMax)) {
-        uint32_t t0 = millis();
-        if (rawLen > 33 && !memcmp(raw, "\x89PNG", 4))              // se a API passar a servir PNG pequeno
-          remoteOk = decodePngScaled(raw, rawLen, ICON_PX, true, lv_color_hex(C_ACCENT), im);
-        else
-          remoteOk = rasterSvgInPlace((char*)raw, ICON_PX, true, lv_color_hex(C_ACCENT), im);   // destrói o buffer
-        free(raw); raw = nullptr;
-        Serial.printf("[sil] %u bytes, raster %s (%dx%d) em %lu ms, psram livre=%u\n", (unsigned)rawLen,
-                      remoteOk ? "OK" : "FALHOU", im.w, im.h, (unsigned long)(millis() - t0), (unsigned)ESP.getFreePsram());
-        if (remoteOk) {                             // bitmap vazio = nanosvg não entendeu o SVG
-          size_t opaque = 0;
-          for (size_t i = 0; i < (size_t)im.w * im.h; i++)
-            if (im.data[i * LV_IMG_PX_SIZE_ALPHA_BYTE + sizeof(lv_color_t)] > 16) opaque++;
-          if (opaque < 4) { Serial.println("[sil] bitmap vazio"); free(im.data); im = {nullptr, 0, 0}; remoteOk = false; }
+    if (silUrl != silFailUrl) { silFailUrl = silUrl; silFails = 0; silRetryAt = 0; }
+    if (!silLoaded || (int32_t)(millis() - silRetryAt) >= 0) {
+      SvgImg im = {nullptr, 0, 0}; bool remoteOk = false, tooBig = false;
+      if (silUrl.length()) {
+        uint8_t* raw = nullptr; size_t rawLen = 0;
+        size_t silMax = psramFound() ? 6UL * 1024 * 1024 : 120000UL;   // com PSRAM aceita SVG grande
+        if (httpGetImgBuf(silUrl, &raw, &rawLen, silMax)) {
+          uint32_t t0 = millis();
+          if (rawLen > 33 && !memcmp(raw, "\x89PNG", 4))              // se a API passar a servir PNG pequeno
+            remoteOk = decodePngScaled(raw, rawLen, ICON_PX, true, lv_color_hex(C_ACCENT), im);
+          else
+            remoteOk = rasterSvgInPlace((char*)raw, ICON_PX, true, lv_color_hex(C_ACCENT), im);   // destrói o buffer
+          free(raw); raw = nullptr;
+          Serial.printf("[sil] %u bytes, raster %s (%dx%d) em %lu ms, psram livre=%u\n", (unsigned)rawLen,
+                        remoteOk ? "OK" : "FALHOU", im.w, im.h, (unsigned long)(millis() - t0), (unsigned)ESP.getFreePsram());
+          if (remoteOk) {                             // bitmap vazio = nanosvg não entendeu o SVG
+            size_t opaque = 0;
+            for (size_t i = 0; i < (size_t)im.w * im.h; i++)
+              if (im.data[i * LV_IMG_PX_SIZE_ALPHA_BYTE + sizeof(lv_color_t)] > 16) opaque++;
+            if (opaque < 4) { Serial.println("[sil] bitmap vazio"); free(im.data); im = {nullptr, 0, 0}; remoteOk = false; }
+          }
+        } else {
+          Serial.println("[sil] download falhou");
+          tooBig = gHttpTooBig;                       // arquivo grande demais: não adianta repetir; usa a genérica
         }
-      } else {
-        Serial.println("[sil] download falhou");
-        if (gHttpTooBig) silTries = 99;           // arquivo grande demais: não adianta repetir; usa a genérica
+      }
+      if (!remoteOk) rasterSvg(GENERIC_SIL_SVG, strlen(GENERIC_SIL_SVG), ICON_PX, true, lv_color_hex(C_ACCENT), im);
+      pushSil(im);
+      silLoaded = true;
+      if (remoteOk || !silUrl.length() || tooBig) { lastSilUrl = silUrl; silFails = 0; }
+      else {
+        silFails++;
+        uint32_t wait = silFails <= 3 ? 15000UL : 300000UL;   // 3 tentativas a cada 15 s, depois 1 a cada 5 min
+        silRetryAt = millis() + wait;
+        Serial.printf("[sil] falhou (%d); nova tentativa em %lu s\n", silFails, (unsigned long)(wait / 1000));
       }
     }
-    if (!remoteOk) rasterSvg(GENERIC_SIL_SVG, strlen(GENERIC_SIL_SVG), ICON_PX, true, lv_color_hex(C_ACCENT), im);
-    pushSil(im);
-    silLoaded = true;
-    if (remoteOk || !silUrl.length() || ++silTries >= 3) { lastSilUrl = silUrl; silTries = 0; }   // até 3 tentativas
   }
 }
 
@@ -1307,7 +1352,7 @@ static void applyUpdates() {
       lv_label_set_text(lblOrg, "---");    lv_label_set_text(lblDst, "---");
       lv_label_set_text(lblAltDist, "");                                 // sem voo: nada de altitude/distância
       lv_label_set_text(lblOrgLine, pt("Rastreando...").c_str());
-      lv_label_set_text(lblDstLine, pt(" ").c_str());
+      lv_label_set_text(lblDstLine, pt("Rota indisponível").c_str());
       lv_label_set_text(lblLogoTxt, "");
       lv_obj_add_flag(imgLogo, LV_OBJ_FLAG_HIDDEN);
       lv_obj_add_flag(imgSil, LV_OBJ_FLAG_HIDDEN);
@@ -1320,7 +1365,20 @@ static void applyUpdates() {
       if (f.alt[0] && f.dist[0]) lv_label_set_text_fmt(lblAltDist, "%s | %s", f.alt, f.dist);
       else                       lv_label_set_text(lblAltDist, f.alt[0] ? f.alt : f.dist);
       lv_label_set_text(lblOrgLine, f.orgLine); lv_label_set_text(lblDstLine, f.dstLine);
-      if (lv_obj_has_flag(imgLogo, LV_OBJ_FLAG_HIDDEN)) lv_label_set_text(lblLogoTxt, f.airline);
+      // Logo e silhueta foram escondidos no estado "sem voo". Se a companhia/modelo for o mesmo, não há novo download
+      // (a URL não mudou) e nada mais os mostraria de volta: reexibe aqui as imagens já carregadas.
+      if (f.showLogo && uiLogoBuf) {
+        if (lv_obj_has_flag(imgLogo, LV_OBJ_FLAG_HIDDEN)) Serial.println("[img] reexibindo logo ja carregado");
+        lv_obj_clear_flag(imgLogo, LV_OBJ_FLAG_HIDDEN); lv_obj_center(imgLogo); lv_label_set_text(lblLogoTxt, "");
+      } else {
+        lv_obj_add_flag(imgLogo, LV_OBJ_FLAG_HIDDEN); lv_label_set_text(lblLogoTxt, f.airline);   // fallback até chegar o novo logo
+      }
+      if (f.showSil && uiSil.data) {
+        if (lv_obj_has_flag(imgSil, LV_OBJ_FLAG_HIDDEN)) Serial.println("[img] reexibindo silhueta ja carregada");
+        lv_obj_clear_flag(imgSil, LV_OBJ_FLAG_HIDDEN); lv_obj_center(imgSil);
+      } else {
+        lv_obj_add_flag(imgSil, LV_OBJ_FLAG_HIDDEN);                                             // não mostra a silhueta do modelo anterior
+      }
       radarSet(false);
     }
   }
