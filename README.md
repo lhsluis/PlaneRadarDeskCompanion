@@ -240,6 +240,7 @@ As rotas HTTP disponíveis são:
 - `GET /` — página web de configuração e OTA;
 - `GET /debug` — monitor de debug com a saída serial em tempo real;
 - `GET /debug/log?since=N` — leitura incremental do histórico serial;
+- `GET /firmware-info` — informações do firmware em execução;
 - `GET /config.json` — configuração sem os valores das senhas;
 - `POST /config` — valida e salva a configuração;
 - `POST /update` — grava o firmware enviado.
@@ -251,7 +252,9 @@ partição OTA presente). Ele mostra as mensagens que o sketch escreve via
 relatórios de crash. O histórico na placa usa um buffer circular de 32 KB com
 PSRAM ou 8 KB sem PSRAM e é perdido quando a placa reinicia. A página do
 navegador mantém os dados que já recebeu, permite pausar a consulta e baixá-los
-como arquivo `.txt`.
+como arquivo `.txt`. A captura só começa depois da sincronização do relógio e
+da conclusão das primeiras consultas de clima e voos; mensagens anteriores
+continuam disponíveis pela Serial USB.
 
 ## Acentos (Á, ã, ç…)
 As fontes embutidas do LVGL só têm ASCII; por padrão o código remove os acentos ("Sábado" -> "Sabado").
@@ -261,6 +264,7 @@ nomeie `font_ui_10` ... `font_ui_48` e ponha `USE_CUSTOM_FONTS 1`. O fonte do Fi
 
 ## Como funciona
 - Task de rede (core 0) busca voo a cada `flighpooling` s e clima (Open-Meteo, sem chave) a cada `wheaterpooling` s.
+- Aeronaves com `alt_baro` igual a `ground` são ignoradas; altitude e distância aparecem sob o modelo no formato `500 ft | 5.6 NM`.
 - UI (core 1) só aplica os dados prontos — o LVGL nunca é tocado pela task de rede.
 - Logo PNG: só baixa quando a companhia muda; decodificado e reduzido no próprio ESP32 com PNGdec.
 - Silhueta SVG: rasterizada no próprio ESP32 com nanosvg para o tamanho configurado em `ICON_PX`, pintada na cor de destaque. Silhuetas PNG também são reduzidas pelo PNGdec; bitmaps vazios ou inválidos usam a silhueta genérica.

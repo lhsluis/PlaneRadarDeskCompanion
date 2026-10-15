@@ -582,6 +582,11 @@ static void fetchFlight() {
   }
 
   JsonObject ac = doc["aircraft"].as<JsonObject>();
+  // aeronave em solo (alt_baro vem como "ground") é ignorada: tratada como "sem voo"
+  if (!ac.isNull() && ac["alt_baro"].is<const char*>()) {
+    Serial.printf("[flight] %s em solo: ignorada\n", S(ac["flight"], "---"));
+    ac = JsonObject();
+  }
   if (ac.isNull()) {
     f.valid = false;
     xSemaphoreTake(gMtx, portMAX_DELAY); gFlight = f; gFlightDirty = true; xSemaphoreGive(gMtx);
@@ -607,8 +612,7 @@ static void fetchFlight() {
   f.alt[0] = 0; f.dist[0] = 0;
   {
     JsonVariantConst ab = ac["alt_baro"];
-    if (ab.is<const char*>()) strlcpy(f.alt, "Solo", sizeof f.alt);          // alt_baro vem como "ground" em solo
-    else if (ab.is<float>()) {
+    if (ab.is<float>()) {
       int ft = (int)ab.as<float>();
       if (ft >= 1000)   snprintf(f.alt, sizeof f.alt, "%d.%03d ft", ft / 1000, ft % 1000);
       else if (ft >= 0) snprintf(f.alt, sizeof f.alt, "%d ft", ft);
@@ -819,6 +823,7 @@ static void cfgGetHandler() {
   String vals[CFG_N]; bool found[CFG_N];
   for (int i = 0; i < CFG_N; i++) found[i] = false;
   JsonDocument doc;
+  doc["fw"] = String(__DATE__) + " " + __TIME__;      // mesma informação do "[boot] firmware de ..."
   JsonArray extras = doc["extras"].to<JsonArray>();
   int pos = 0;
   while (pos <= (int)txt.length()) {
@@ -1011,11 +1016,25 @@ static void startOta() {
   xTaskCreatePinnedToCore(otaTask, "ota", 8192, nullptr, 0, nullptr, 0);
 }
 
+// O buffer do debug só é ligado depois que relógio, clima e a 1ª consulta de voos terminaram
+// (ou após 60 s, para o caso de a rede nunca subir), para não impactar a inicialização.
+static char gBootInfo[160] = "";
+static void startDebugWhenReady(bool doneW, bool doneF) {
+  if (DBG.capturing()) return;
+  bool clockOk = time(nullptr) > 1700000000;
+  bool ready = (clockOk && doneW && (doneF || isSleepTime())) || millis() > 60000;
+  if (!ready) return;
+  DBG.startCapture();
+  Serial.print(gBootInfo);                                // mesma linha de boot que sai no Serial
+  Serial.println("[debug] monitor iniciado (apos relogio, clima e 1a consulta de voos)");
+}
+
 static void netTask(void*) {
   bool doneF = false, doneW = false;
   uint32_t lastF = 0, lastW = 0, lastReconnect = 0;
   for (;;) {
     if (gOtaBusy) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }   // não disputa o WiFi durante a atualização
+    startDebugWhenReady(doneW, doneF);
     if (WiFi.status() != WL_CONNECTED) {
       if (millis() - lastReconnect > 10000) { lastReconnect = millis(); WiFi.disconnect(); WiFi.begin(P.ssid.c_str(), P.pass.c_str()); }
       vTaskDelay(pdMS_TO_TICKS(500)); continue;
@@ -1037,6 +1056,7 @@ static void netTask(void*) {
 // =====================================================================
 static lv_obj_t *lblTitle, *lblTime, *lblDate, *lblCity, *imgWx, *lblTemp, *lblCond;
 static lv_obj_t *lblAirline, *lblFlight, *lblIata, *lblType, *lblDesc, *lblOrg, *lblDst, *lblOrgLine, *lblDstLine;
+static lv_obj_t *lblAltDist;
 static lv_obj_t *imgLogo, *lblLogoTxt, *imgSil, *imgRadar;
 
 // O lv_gif continua decodificando frames mesmo escondido (HIDDEN não pausa o timer dele).
@@ -1069,7 +1089,6 @@ static void loadRadarGif() {
   Serial.println("[radar] nao foi possivel carregar em memoria; lendo do SD");
   lv_gif_set_src(imgRadar, "S:/radar.gif");
 }
-static lv_obj_t *lblAlt, *lblDist;
 static lv_img_dsc_t dscLogo, dscSil;
 static uint8_t* uiLogoBuf = nullptr;
 static SvgImg uiSil = {nullptr, 0, 0};
@@ -1189,6 +1208,9 @@ static void buildUI() {
   lblAirline = mkLabel(fc, F10, C_MUTED, "");                       // nome da companhia, abaixo do código IATA do voo
   centerIn(lblAirline, 54, 48, 90, LV_LABEL_LONG_SCROLL_CIRCULAR);
   mkCol(fc, 144, 100, "AERONAVE", &lblType, &lblDesc);
+  // altitude | distância, abaixo do modelo da aeronave (ex.: 500 ft | 5.6 NM)
+  lblAltDist = mkLabel(fc, F10, C_ACCENT, "");
+  centerIn(lblAltDist, 144, 49, 100, LV_LABEL_LONG_CLIP);
   mkBox(fc, 144, 8, 1, 52, 0, 0x1F4047);
 
   // separador + ROTA em linha própria
@@ -1208,14 +1230,6 @@ static void buildUI() {
   lv_obj_set_width(lblDst, 88); lv_label_set_long_mode(lblDst, LV_LABEL_LONG_CLIP);
   lv_obj_set_pos(lblDst, 184, 82);
 
-  // altitude à esquerda da rota e distância à direita (fonte menor, mesma linha dos códigos)
-  lblAlt = mkLabel(fc, F10, C_MUTED, "");
-  lv_obj_set_width(lblAlt, 66); lv_label_set_long_mode(lblAlt, LV_LABEL_LONG_CLIP);
-  lv_obj_set_style_text_align(lblAlt, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_pos(lblAlt, 6, 84);
-  lblDist = mkLabel(fc, F10, C_MUTED, "");
-  lv_obj_set_width(lblDist, 66); lv_label_set_long_mode(lblDist, LV_LABEL_LONG_CLIP);
-  lv_obj_set_pos(lblDist, 226, 84);
 
   // detalhe da rota (formato da imagem 2)
   lblOrgLine = mkLabel(fc, F10, C_ROUTE, "");
@@ -1291,9 +1305,9 @@ static void applyUpdates() {
       lv_label_set_text(lblFlight, "--");  lv_label_set_text(lblIata, "");  lv_label_set_text(lblAirline, "");
       lv_label_set_text(lblType, "--");    lv_label_set_text(lblDesc, "");
       lv_label_set_text(lblOrg, "---");    lv_label_set_text(lblDst, "---");
-      lv_label_set_text(lblAlt, "");       lv_label_set_text(lblDist, "");   // sem voo: nada de altitude/distância
+      lv_label_set_text(lblAltDist, "");                                 // sem voo: nada de altitude/distância
       lv_label_set_text(lblOrgLine, pt("Rastreando...").c_str());
-      lv_label_set_text(lblDstLine, pt("Rota indisponível").c_str());
+      lv_label_set_text(lblDstLine, pt(" ").c_str());
       lv_label_set_text(lblLogoTxt, "");
       lv_obj_add_flag(imgLogo, LV_OBJ_FLAG_HIDDEN);
       lv_obj_add_flag(imgSil, LV_OBJ_FLAG_HIDDEN);
@@ -1303,8 +1317,8 @@ static void applyUpdates() {
       lv_label_set_text(lblAirline, f.airlineName);                 // vazio quando a API não traz o nome
       lv_label_set_text(lblType, f.type);       lv_label_set_text(lblDesc, f.desc);
       lv_label_set_text(lblOrg, f.org);         lv_label_set_text(lblDst, f.dst);
-      lv_label_set_text(lblAlt,  strlen(f.org) <= 4 ? f.alt  : "");   // com "Indisponível" não há espaço ao lado
-      lv_label_set_text(lblDist, strlen(f.dst) <= 4 ? f.dist : "");
+      if (f.alt[0] && f.dist[0]) lv_label_set_text_fmt(lblAltDist, "%s | %s", f.alt, f.dist);
+      else                       lv_label_set_text(lblAltDist, f.alt[0] ? f.alt : f.dist);
       lv_label_set_text(lblOrgLine, f.orgLine); lv_label_set_text(lblDstLine, f.dstLine);
       if (lv_obj_has_flag(imgLogo, LV_OBJ_FLAG_HIDDEN)) lv_label_set_text(lblLogoTxt, f.airline);
       radarSet(false);
@@ -1381,7 +1395,8 @@ static const char* resetReasonText(esp_reset_reason_t r) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.printf("\n[boot] firmware de %s %s | motivo do reinicio: %s\n", __DATE__, __TIME__, resetReasonText(esp_reset_reason()));
+  snprintf(gBootInfo, sizeof gBootInfo, "\n[boot] firmware de %s %s | motivo do reinicio: %s\n", __DATE__, __TIME__, resetReasonText(esp_reset_reason()));
+  Serial.print(gBootInfo);
   gMtx = xSemaphoreCreateMutex();
 
   //IF your screen is upsidedown uncoment the line bellow and comment the next one

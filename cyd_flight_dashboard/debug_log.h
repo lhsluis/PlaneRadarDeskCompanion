@@ -13,8 +13,11 @@
 
 class DebugOut : public Print {
  public:
-  void begin(unsigned long baud) {
-    Serial.begin(baud);
+  // begin() só abre o Serial real: o buffer do debug fica desligado (nada é alocado nem gravado)
+  // até startCapture() ser chamado, para não pesar na inicialização.
+  void begin(unsigned long baud) { Serial.begin(baud); }
+  bool capturing() const { return _buf != nullptr; }
+  void startCapture() {
     if (!_buf) {
       bool ps = psramFound();
       size_t cap = ps ? 32768 : 8192;

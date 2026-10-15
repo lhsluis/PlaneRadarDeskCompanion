@@ -56,6 +56,7 @@ button.sec{background:#10262e;color:#3de0b5;border:1px solid #3de0b5;margin-top:
 </section></form>
 
 <section><h2 style="margin-top:12px">Firmware</h2>
+<div style="font-size:13px;color:#9fb3bd;margin-top:8px">Instalado atualmente: <b id="fw" style="color:#e8f3f5">...</b></div>
 <p style="font-size:14px">Envie o arquivo <b>.ino.bin</b> gerado pela Arduino IDE (Sketch &rarr; Exportar binário compilado). Não envie os arquivos "bootloader", "partitions" ou "merged".</p>
 <input type="file" id="f" accept=".bin"><button onclick="up()">Enviar e atualizar</button>
 <progress id="p" value="0" max="100" hidden></progress><div class="msg" id="s"></div></section>
@@ -72,6 +73,7 @@ function addRow(k,v,s,n){var xs=document.querySelectorAll('#ex .xr');if(xs.lengt
  d.appendChild(a);d.appendChild(b);d.appendChild(x);$('ex').appendChild(d);if(n)a.focus()}
 function cmsg(t,e){var m=$('cm');m.textContent=t;m.className='msg'+(e?' err':'')}
 fetch('/config.json').then(function(r){return r.json()}).then(function(c){
+ $('fw').textContent=c.fw||'desconhecido';
  F.forEach(function(k){var e=$(k);if(!e)return;
   if(e.type=='password'){e.placeholder=c[k+'_set']?'•••••••• (mantida)':'(não definida)'}else{e.value=c[k]==null?'':c[k]}});
  $('bv').textContent=$('screenbrightness').value;
