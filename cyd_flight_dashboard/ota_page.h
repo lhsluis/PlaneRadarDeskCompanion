@@ -16,12 +16,14 @@ input:focus{outline:1px solid #3de0b5}input[type=range]{padding:0;height:28px;ac
 button{background:#3de0b5;color:#04221b;font-weight:600;cursor:pointer;margin-top:18px}
 progress{width:100%;margin-top:16px;height:14px}.msg{margin-top:12px;font-size:14px;color:#9fb3bd;min-height:18px}.err{color:#ff8a80}
 .warn{font-size:12px;color:#e8a87c;margin-top:8px}
+.lk{display:inline-block;padding:8px 14px;border:1px solid #3de0b5;border-radius:8px;color:#3de0b5;text-decoration:none;font-size:13px}
 .hint{font-size:12px;color:#6f8e96;margin-top:6px}
 .xr{display:flex;gap:8px;margin-top:8px}.xr input{margin-top:0}.xr .xk{flex:0 0 38%}
 .xr button{width:42px;margin-top:0;padding:0;background:#10262e;color:#ff8a80;border:1px solid #1f4047}
 button.sec{background:#10262e;color:#3de0b5;border:1px solid #3de0b5;margin-top:12px}
 </style></head><body>
 <h1>PlaneRadar - Desk Companion</h1><div style="color:#6f8e96;font-size:13px">Configuração e atualização do dispositivo</div>
+<div style="margin-top:12px"><a class="lk" href="/debug">Debug monitor &rarr;</a></div>
 
 <form id="cf"><section>
 <h2>Localização</h2>

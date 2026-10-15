@@ -14,6 +14,7 @@
 #include <Update.h>
 #include <ESPmDNS.h>
 #include <esp_ota_ops.h>
+#include <esp_system.h>
 #include <time.h>
 #include <ArduinoJson.h>
 #define LV_CONF_INCLUDE_SIMPLE
@@ -22,15 +23,17 @@
 #include <PNGdec.h>          // biblioteca "PNGdec" (Larry Bank)
 #include "dashboard_types.h"
 #include "ota_page.h"
+#include "debug_page.h"
+#include "debug_log.h"      // espelha o Serial para a página /debug (deve vir depois dos includes de bibliotecas)
 
 #define NANOSVG_IMPLEMENTATION
 #include "nanosvg.h"
 #define NANOSVGRAST_IMPLEMENTATION
 #include "nanosvgrast.h"
 
-// ===================================================================================================
-//  PINOS  (padrão = Freenove ESP32-S3 Display 2.8" (ILI9341) FNK0104B)  >>> CONFIRME NA SUA PLACA <<<
-// ===================================================================================================
+// =====================================================================
+//  PINOS  (padrão = CYD clássico ESP32-2432S028R)  >>> CONFIRME NA SUA PLACA <<<
+// =====================================================================
 #define TFT_SCLK_PIN 12
 #define TFT_MOSI_PIN 11
 #define TFT_MISO_PIN 13
@@ -129,7 +132,7 @@ struct Params {
   String ssid, pass, urlbase;
   String tz = "WET0WEST,M3.5.0/1,M10.5.0/2";     // Portugal
   String sleepTimer, wakeupTimer;
-  String otaUser = "admin", otaPass, otaHost = "planeradarcompanion";   // OTA só liga se otapass estiver definido
+  String otaUser = "admin", otaPass, otaHost = "cyd-flights";   // OTA só liga se otapass estiver definido
   uint32_t weatherMs = 1800000UL, flightMs = 15000UL;
 } P;
 
@@ -346,7 +349,7 @@ static bool decodePngScaled(const uint8_t* data, size_t len, int box, bool tint,
 #define SV_END  "</svg>"
 #define CLOUD(col) "<g fill='" col "'><circle cx='7' cy='14.5' r='3.5'/><circle cx='12' cy='10.5' r='5'/>" \
                    "<circle cx='17.5' cy='14' r='4'/><rect x='7' y='14' width='10.5' height='4.5'/></g>"
-static const char* WX_SVG[7] = {
+static const char* WX_SVG[9] = {
   /*0 sol*/       SV_HEAD "<circle cx='12' cy='12' r='5' fill='#FFC83D'/>"
                   "<path d='M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3M4.6 4.6l2.1 2.1M17.3 17.3l2.1 2.1M4.6 19.4l2.1-2.1M17.3 6.7l2.1-2.1' stroke='#FFC83D' stroke-width='1.8' stroke-linecap='round' fill='none'/>" SV_END,
   /*1 parcial*/   SV_HEAD "<circle cx='8' cy='8' r='3.6' fill='#FFC83D'/>"
@@ -361,9 +364,26 @@ static const char* WX_SVG[7] = {
                   "<path d='M5 18h14M7 21h10' stroke='#9FB3BD' stroke-width='1.7' stroke-linecap='round' fill='none'/>" SV_END,
   /*6 trovoada*/  SV_HEAD "<g transform='translate(0,-3)'>" CLOUD("#9FB3BD") "</g>"
                   "<polygon points='12.5,14.5 9,20 11.5,20 10.5,23.5 15,18 12.5,18 13.5,14.5' fill='#FFC83D'/>" SV_END,
+  /*7 lua (noite, limpo)*/  SV_HEAD "<path fill='#F4EBC1' d='M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z'/>" SV_END,
+  /*8 lua + nuvem (noite, parcial)*/ SV_HEAD "<g transform='scale(0.62)'><path fill='#F4EBC1' d='M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z'/></g>"
+                  "<g transform='translate(2.5,3)'>" CLOUD("#CFE8F3") "</g>" SV_END,
 };
-static SvgImg wxImg[7];
-static lv_img_dsc_t wxDsc[7];
+static SvgImg wxImg[9];
+static lv_img_dsc_t wxDsc[9];
+
+// À noite (18:00 até 05:59) os ícones com sol viram lua (limpo -> lua, parcial -> lua com nuvem)
+static int  wxIc = 2;            // ícone base (0..6) do último clima recebido
+static bool wxNight = false;
+static bool isNightNow() {
+  struct tm t;
+  if (!getLocalTime(&t, 0) || t.tm_year < 120) return false;      // sem hora válida: ícones de dia
+  return t.tm_hour >= 18 || t.tm_hour < 6;
+}
+static const lv_img_dsc_t* wxIconFor(int ic, bool night) {
+  if (night && ic == 0) return &wxDsc[7];
+  if (night && ic == 1) return &wxDsc[8];
+  return &wxDsc[ic];
+}
 
 // Silhueta usada quando a API não fornece uma imagem válida.
 static const char* GENERIC_SIL_SVG =
@@ -431,6 +451,7 @@ struct FlightUI {
   char flight[16], iata[16], airline[8], type[8], desc[48];
   char org[16], dst[16], orgLine[112], dstLine[112], city[64];
   char alt[16], dist[16];            // altitude (ft) e distância (NM) já formatadas
+  char airlineName[40];              // flight_info.airline.name
 };
 static SemaphoreHandle_t gMtx;
 static FlightUI gFlight;  static bool gFlightDirty = false;
@@ -574,6 +595,7 @@ static void fetchFlight() {
   strlcpy(f.flight,  S(ac["flight"], "---"), sizeof f.flight);  trimInPlace(f.flight);
   strlcpy(f.iata,    S(fi["callsign_iata"], ""), sizeof f.iata);
   strlcpy(f.airline, S(fi["airline"]["icao"], ""), sizeof f.airline);
+  strlcpy(f.airlineName, S(fi["airline"]["name"], ""), sizeof f.airlineName);
   strlcpy(f.type,    S(ac["t"], "---"), sizeof f.type);
   strlcpy(f.desc,    S(ac["desc"], ""), sizeof f.desc);
   const char* orgCode = S(org["iata_code"], S(org["icao_code"], "---"));
@@ -602,7 +624,7 @@ static void fetchFlight() {
   else snprintf(f.dstLine, sizeof f.dstLine, "%s" SEP "%s" SEP "%s" SEP "%s", f.dst,
                 S(dst["name"], ""), S(dst["municipality"], ""), S(dst["country_name"], ""));
 
-  plainInPlace(f.flight); plainInPlace(f.iata); plainInPlace(f.desc);
+  plainInPlace(f.flight); plainInPlace(f.iata); plainInPlace(f.desc); plainInPlace(f.airlineName);
   plainInPlace(f.orgLine); plainInPlace(f.dstLine);
 
   // Prefere as versões leves servidas pela API (se existirem); senão usa os campos originais.
@@ -938,6 +960,30 @@ static void cfgPostHandler() {
   ESP.restart();
 }
 
+// ---------------------------------------------------------------------
+//  Debug monitor: /debug (página) e /debug/log?since=N (texto novo desde o deslocamento N)
+// ---------------------------------------------------------------------
+static void dbgPageHandler() {
+  if (!otaCheckAuth()) return;
+  otaServer.send_P(200, "text/html", DEBUG_PAGE);
+}
+static void dbgLogHandler() {
+  if (!otaCheckAuth()) return;
+  uint32_t since = strtoul(otaServer.arg("since").c_str(), nullptr, 10);
+  String out; out.reserve(2048);
+  char chunk[512]; uint32_t next = since; bool reset = false, r1 = false;
+  for (int i = 0; i < 32; i++) {                       // até 16 KB por resposta
+    size_t n = DBG.read(next, chunk, sizeof chunk, &next, &r1);
+    if (i == 0) reset = r1;
+    if (!n) break;
+    out.concat(chunk, (unsigned int)n);
+  }
+  otaServer.sendHeader("Cache-Control", "no-store");
+  otaServer.sendHeader("X-Next", String(next));
+  otaServer.sendHeader("X-Reset", reset ? "1" : "0");
+  otaServer.send(200, "text/plain; charset=utf-8", out);
+}
+
 static void otaTask(void*) {
   for (;;) { otaServer.handleClient(); vTaskDelay(pdMS_TO_TICKS(gOtaBusy ? 1 : 10)); }
 }
@@ -956,6 +1002,8 @@ static void startOta() {
     if (!otaServer.authenticate(P.otaUser.c_str(), P.otaPass.c_str())) { otaServer.requestAuthentication(); return; }
     otaServer.send_P(200, "text/html", OTA_PAGE);
   });
+  otaServer.on("/debug", HTTP_GET, dbgPageHandler);
+  otaServer.on("/debug/log", HTTP_GET, dbgLogHandler);
   otaServer.on("/config.json", HTTP_GET, cfgGetHandler);
   otaServer.on("/config", HTTP_POST, cfgPostHandler);
   otaServer.on("/update", HTTP_POST, otaFinishHandler, otaUploadHandler);
@@ -988,7 +1036,7 @@ static void netTask(void*) {
 //  UI (LVGL)
 // =====================================================================
 static lv_obj_t *lblTitle, *lblTime, *lblDate, *lblCity, *imgWx, *lblTemp, *lblCond;
-static lv_obj_t *lblFlight, *lblIata, *lblType, *lblDesc, *lblOrg, *lblDst, *lblOrgLine, *lblDstLine;
+static lv_obj_t *lblAirline, *lblFlight, *lblIata, *lblType, *lblDesc, *lblOrg, *lblDst, *lblOrgLine, *lblDstLine;
 static lv_obj_t *imgLogo, *lblLogoTxt, *imgSil, *imgRadar;
 
 // O lv_gif continua decodificando frames mesmo escondido (HIDDEN não pausa o timer dele).
@@ -1052,9 +1100,9 @@ static void centerIn(lv_obj_t* l, int x, int y, int w, lv_label_long_mode_t mode
 static void mkCol(lv_obj_t* p, int x, int w, const char* head, lv_obj_t** val, lv_obj_t** sub, const lv_font_t* vf = F14) {
   lv_obj_t* h = mkLabel(p, F10, C_ACCENT, head);
   lv_obj_set_style_text_letter_space(h, 1, 0);
-  centerIn(h, x, 8, w, LV_LABEL_LONG_CLIP);
-  if (val) { *val = mkLabel(p, vf, C_WHITE, "--"); centerIn(*val, x, 22, w, LV_LABEL_LONG_CLIP); }
-  if (sub) { *sub = mkLabel(p, F10, C_MUTED, ""); centerIn(*sub, x, 40, w, LV_LABEL_LONG_SCROLL_CIRCULAR); }
+  centerIn(h, x, 6, w, LV_LABEL_LONG_CLIP);
+  if (val) { *val = mkLabel(p, vf, C_WHITE, "--"); centerIn(*val, x, 19, w, LV_LABEL_LONG_CLIP); }
+  if (sub) { *sub = mkLabel(p, F10, C_MUTED, ""); centerIn(*sub, x, 36, w, LV_LABEL_LONG_SCROLL_CIRCULAR); }
 }
 
 static void buildUI() {
@@ -1138,34 +1186,36 @@ static void buildUI() {
 
   // colunas VOO | AERONAVE
   mkCol(fc, 54, 90, "VOO", &lblFlight, &lblIata);
+  lblAirline = mkLabel(fc, F10, C_MUTED, "");                       // nome da companhia, abaixo do código IATA do voo
+  centerIn(lblAirline, 54, 48, 90, LV_LABEL_LONG_SCROLL_CIRCULAR);
   mkCol(fc, 144, 100, "AERONAVE", &lblType, &lblDesc);
-  mkBox(fc, 144, 8, 1, 44, 0, 0x1F4047);
+  mkBox(fc, 144, 8, 1, 52, 0, 0x1F4047);
 
   // separador + ROTA em linha própria
-  mkBox(fc, 12, 60, 274, 1, 0, 0x16323A);
+  mkBox(fc, 12, 64, 274, 1, 0, 0x16323A);
   lv_obj_t* rh = mkLabel(fc, F10, C_ACCENT, "ROTA");
   lv_obj_set_style_text_letter_space(rh, 1, 0);
-  centerIn(rh, 0, 67, 298, LV_LABEL_LONG_CLIP);
+  centerIn(rh, 0, 69, 298, LV_LABEL_LONG_CLIP);
 
   lblOrg = mkLabel(fc, F14, C_WHITE, "---");
   lv_obj_set_width(lblOrg, 88); lv_label_set_long_mode(lblOrg, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_align(lblOrg, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_pos(lblOrg, 26, 80);
-  mkBox(fc, 118, 86, 4, 4, 2, C_ORANGE);
-  mkBox(fc, 122, 87, 54, 1, 0, 0x2A5A55);
-  mkBox(fc, 176, 86, 4, 4, 2, C_ACCENT);
+  lv_obj_set_pos(lblOrg, 26, 82);
+  mkBox(fc, 118, 88, 4, 4, 2, C_ORANGE);
+  mkBox(fc, 122, 89, 54, 1, 0, 0x2A5A55);
+  mkBox(fc, 176, 88, 4, 4, 2, C_ACCENT);
   lblDst = mkLabel(fc, F14, C_WHITE, "---");
   lv_obj_set_width(lblDst, 88); lv_label_set_long_mode(lblDst, LV_LABEL_LONG_CLIP);
-  lv_obj_set_pos(lblDst, 184, 80);
+  lv_obj_set_pos(lblDst, 184, 82);
 
   // altitude à esquerda da rota e distância à direita (fonte menor, mesma linha dos códigos)
   lblAlt = mkLabel(fc, F10, C_MUTED, "");
   lv_obj_set_width(lblAlt, 66); lv_label_set_long_mode(lblAlt, LV_LABEL_LONG_CLIP);
   lv_obj_set_style_text_align(lblAlt, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_pos(lblAlt, 6, 82);
+  lv_obj_set_pos(lblAlt, 6, 84);
   lblDist = mkLabel(fc, F10, C_MUTED, "");
   lv_obj_set_width(lblDist, 66); lv_label_set_long_mode(lblDist, LV_LABEL_LONG_CLIP);
-  lv_obj_set_pos(lblDist, 226, 82);
+  lv_obj_set_pos(lblDist, 226, 84);
 
   // detalhe da rota (formato da imagem 2)
   lblOrgLine = mkLabel(fc, F10, C_ROUTE, "");
@@ -1208,6 +1258,8 @@ static void clockCb(lv_timer_t*) {
   snprintf(d, sizeof d, "%s, %d de %s de %d", WD[t.tm_wday], t.tm_mday, MON[t.tm_mon], t.tm_year + 1900);
   plainInPlace(d);
   lv_label_set_text(lblDate, d);
+  bool n = (t.tm_hour >= 18 || t.tm_hour < 6);                      // troca sol <-> lua na virada das 18:00 / 06:00
+  if (n != wxNight) { wxNight = n; lv_img_set_src(imgWx, wxIconFor(wxIc, wxNight)); }
 }
 
 // ---- aplica dados vindos da rede (roda na thread do LVGL) ----
@@ -1229,13 +1281,14 @@ static void applyUpdates() {
     Wx w = wxFromCode(code);
     lv_label_set_text_fmt(lblTemp, "%d", temp);
     lv_label_set_text(lblCond, pt(w.d).c_str());
-    lv_img_set_src(imgWx, &wxDsc[w.ic]);
+    wxIc = w.ic; wxNight = isNightNow();
+    lv_img_set_src(imgWx, wxIconFor(wxIc, wxNight));
   }
 
   if (fd) {
     if (f.city[0]) lv_label_set_text(lblCity, f.city);      // com ou sem voo
     if (!f.valid) {
-      lv_label_set_text(lblFlight, "--");  lv_label_set_text(lblIata, "");
+      lv_label_set_text(lblFlight, "--");  lv_label_set_text(lblIata, "");  lv_label_set_text(lblAirline, "");
       lv_label_set_text(lblType, "--");    lv_label_set_text(lblDesc, "");
       lv_label_set_text(lblOrg, "---");    lv_label_set_text(lblDst, "---");
       lv_label_set_text(lblAlt, "");       lv_label_set_text(lblDist, "");   // sem voo: nada de altitude/distância
@@ -1247,6 +1300,7 @@ static void applyUpdates() {
       radarSet(true);
     } else {
       lv_label_set_text(lblFlight, f.flight);   lv_label_set_text(lblIata, f.iata);
+      lv_label_set_text(lblAirline, f.airlineName);                 // vazio quando a API não traz o nome
       lv_label_set_text(lblType, f.type);       lv_label_set_text(lblDesc, f.desc);
       lv_label_set_text(lblOrg, f.org);         lv_label_set_text(lblDst, f.dst);
       lv_label_set_text(lblAlt,  strlen(f.org) <= 4 ? f.alt  : "");   // com "Indisponível" não há espaço ao lado
@@ -1309,8 +1363,25 @@ static void fatal(const char* msg) {
   for (;;) { lv_timer_handler(); delay(5); }
 }
 
+static const char* resetReasonText(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "energia ligada";
+    case ESP_RST_EXT:       return "reset externo";
+    case ESP_RST_SW:        return "software (ESP.restart)";
+    case ESP_RST_PANIC:     return "PANICO (excecao/crash)";
+    case ESP_RST_INT_WDT:   return "watchdog de interrupcao";
+    case ESP_RST_TASK_WDT:  return "watchdog de task (loop travado)";
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "saida do deep sleep";
+    case ESP_RST_BROWNOUT:  return "queda de tensao (brownout)";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "desconhecido";
+  }
+}
+
 void setup() {
   Serial.begin(115200);
+  Serial.printf("\n[boot] firmware de %s %s | motivo do reinicio: %s\n", __DATE__, __TIME__, resetReasonText(esp_reset_reason()));
   gMtx = xSemaphoreCreateMutex();
 
   //IF your screen is upsidedown uncoment the line bellow and comment the next one
@@ -1342,7 +1413,7 @@ void setup() {
   lv_disp_set_bg_opa(lv_disp_get_default(), LV_OPA_COVER);
 
   // ícones de clima
-  for (int i = 0; i < 7; i++) {
+  for (int i = 0; i < 9; i++) {
     if (rasterSvg(WX_SVG[i], strlen(WX_SVG[i]), 24, false, lv_color_black(), wxImg[i])) fillDsc(wxDsc[i], wxImg[i]);
   }
 
@@ -1360,7 +1431,6 @@ void setup() {
   tft.setBrightness(P.brightness);     // screenbrightness (padrão 255 se a chave não existir)
 
   setStatus("CONECTANDO WIFI...");
-  WiFi.setHostname(P.otaHost.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.begin(P.ssid.c_str(), P.pass.c_str());
   uint32_t t0 = millis();
