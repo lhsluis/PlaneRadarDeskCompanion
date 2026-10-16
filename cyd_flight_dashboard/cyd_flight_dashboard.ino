@@ -186,15 +186,40 @@ static bool loadParams() {
   return P.ssid.length() && P.urlbase.length();
 }
 
-static bool isSleepTime() {
+// Estado de sleep: calculado em UM só lugar (updateSleepState, chamado pelo loop 1x/s) e lido por
+// todos (brilho e netTask) via isSleepTime(). Assim a tela e a busca de voos nunca discordam, e uma
+// leitura de hora ruim/instável não faz o aparelho acordar e dormir de novo.
+static volatile bool gSleeping = false;
+static bool isSleepTime() { return gSleeping; }
+
+// Resultado bruto da janela para a hora local atual. Retorna false em *valid se não dá para decidir.
+static bool sleepWindowNow(bool* valid, int* hh, int* mm) {
+  *valid = false;
   uint16_t sleepAt, wakeAt;
-  if (!parseClock(P.sleepTimer, sleepAt) || !parseClock(P.wakeupTimer, wakeAt) || sleepAt == wakeAt)
-    return false;
-  struct tm now;
-  if (!getLocalTime(&now, 0)) return false;
+  if (!parseClock(P.sleepTimer, sleepAt) || !parseClock(P.wakeupTimer, wakeAt) || sleepAt == wakeAt) { *valid = true; *hh = *mm = -1; return false; }  // sem janela configurada
+  time_t t = time(nullptr);
+  if (t < 1700000000) return false;                       // hora ainda não sincronizada: não decide
+  struct tm now; localtime_r(&t, &now);
+  *hh = now.tm_hour; *mm = now.tm_min; *valid = true;
   int current = now.tm_hour * 60 + now.tm_min;
   if (sleepAt < wakeAt) return current >= sleepAt && current < wakeAt;
-  return current >= sleepAt || current < wakeAt;
+  return current >= sleepAt || current < wakeAt;           // janela atravessa a meia-noite (ex.: 23:00 -> 07:30)
+}
+
+static void updateSleepState() {
+  static uint32_t lastChk = 0; static bool first = true; static int streak = 0;
+  if (millis() - lastChk < 1000) return;
+  lastChk = millis();
+  bool valid; int hh, mm;
+  bool raw = sleepWindowNow(&valid, &hh, &mm);
+  if (!valid) return;                                      // sem hora: mantém o estado atual (nunca "acorda" por falha de leitura)
+  if (raw == gSleeping) { streak = 0; first = false; return; }
+  // mudança de estado: a primeira leitura válida vale na hora; depois exige 5 leituras seguidas (5 s)
+  if (!first && ++streak < 5) return;
+  streak = 0; first = false;
+  gSleeping = raw;
+  Serial.printf("[sleep] %s (hora local %02d:%02d, janela %s-%s)\n", raw ? "ENTRANDO em sleep" : "SAINDO do sleep",
+                hh, mm, P.sleepTimer.c_str(), P.wakeupTimer.c_str());
 }
 
 // =====================================================================
@@ -459,7 +484,7 @@ static FlightUI gFlight;  static bool gFlightDirty = false;
 static uint8_t* gPendLogo = nullptr; static size_t gPendLogoLen = 0; static int gPendLogoW = 0, gPendLogoH = 0;
 static bool gLogoChanged = false;
 static SvgImg gPendSil = {nullptr, 0, 0}; static bool gSilChanged = false;
-static int gTemp = 0, gWxCode = -1; static bool gWxDirty = false;
+static float gTemp = 0; static int gWxCode = -1; static bool gWxDirty = false;
 
 static void pushLogo(uint8_t* b, size_t n, int w, int h) {
   xSemaphoreTake(gMtx, portMAX_DELAY);
@@ -745,7 +770,7 @@ static void fetchWeather() {
   JsonObject c = doc["current"].as<JsonObject>();
   if (c.isNull()) return;
   xSemaphoreTake(gMtx, portMAX_DELAY);
-  gTemp = (int)lroundf(c["temperature_2m"].as<float>());
+  gTemp = c["temperature_2m"].as<float>();                 // mantém a casa decimal (ex.: 13.9)
   gWxCode = c["weather_code"] | 3;
   gWxDirty = true;
   xSemaphoreGive(gMtx);
@@ -1326,7 +1351,7 @@ static void applyUpdates() {
   if (!xSemaphoreTake(gMtx, 0)) return;
   bool fd = gFlightDirty, wd = gWxDirty, lc = gLogoChanged, sc = gSilChanged;
   static FlightUI cur;                         // último voo aplicado (usado no fallback do logo)
-  FlightUI f; memset(&f, 0, sizeof f); int temp = gTemp, code = gWxCode;
+  FlightUI f; memset(&f, 0, sizeof f); float temp = gTemp; int code = gWxCode;
   uint8_t* logo = nullptr; size_t ln = 0; int lw = 0, lh = 0;
   SvgImg sil = {nullptr, 0, 0};
   if (fd) { f = gFlight; cur = f; gFlightDirty = false; }
@@ -1338,7 +1363,9 @@ static void applyUpdates() {
 
   if (wd) {
     Wx w = wxFromCode(code);
-    lv_label_set_text_fmt(lblTemp, "%d", temp);
+    char tb[12]; snprintf(tb, sizeof tb, "%.1f", (double)temp);   // (o printf do LVGL não suporta %f)
+    char* dot = strchr(tb, '.'); if (dot) *dot = ',';  
+    lv_label_set_text(lblTemp, tb);
     lv_label_set_text(lblCond, pt(w.d).c_str());
     wxIc = w.ic; wxNight = isNightNow();
     lv_img_set_src(imgWx, wxIconFor(wxIc, wxNight));
@@ -1351,8 +1378,8 @@ static void applyUpdates() {
       lv_label_set_text(lblType, "--");    lv_label_set_text(lblDesc, "");
       lv_label_set_text(lblOrg, "---");    lv_label_set_text(lblDst, "---");
       lv_label_set_text(lblAltDist, "");                                 // sem voo: nada de altitude/distância
-      lv_label_set_text(lblOrgLine, pt("Rastreando...").c_str());
-      lv_label_set_text(lblDstLine, pt("Rota indisponível").c_str());
+      lv_label_set_text(lblOrgLine, pt("").c_str());
+      lv_label_set_text(lblDstLine, pt("Rastreando...").c_str());
       lv_label_set_text(lblLogoTxt, "");
       lv_obj_add_flag(imgLogo, LV_OBJ_FLAG_HIDDEN);
       lv_obj_add_flag(imgSil, LV_OBJ_FLAG_HIDDEN);
@@ -1525,6 +1552,7 @@ void loop() {
   lv_timer_handler();
   applyUpdates();
   static bool wasSleeping = false;
+  updateSleepState();
   bool sleeping = isSleepTime();
   if (sleeping != wasSleeping) {
     wasSleeping = sleeping;
