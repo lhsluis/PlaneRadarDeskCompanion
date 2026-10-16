@@ -21,8 +21,14 @@ class DebugOut : public Print {
     if (!_buf) {
       bool ps = psramFound();
       size_t cap = ps ? 32768 : 8192;
-      _buf = (uint8_t*)heap_caps_malloc(cap, ps ? (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : MALLOC_CAP_8BIT);
-      if (_buf) _cap = cap;
+      uint8_t* b = (uint8_t*)heap_caps_malloc(cap, ps ? (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : MALLOC_CAP_8BIT);
+      if (b) {
+        // Publica _cap e _buf juntos, dentro da seção crítica: outra task que esteja imprimindo (append)
+        // nunca enxerga _buf já definido com _cap ainda 0 (o que causaria divisão por zero em % _cap).
+        portENTER_CRITICAL(&_mux);
+        _cap = cap; _buf = b;
+        portEXIT_CRITICAL(&_mux);
+      }
     }
   }
   size_t write(uint8_t c) override { return write(&c, 1); }
@@ -39,6 +45,7 @@ class DebugOut : public Print {
   size_t read(uint32_t from, char* out, size_t maxn, uint32_t* next, bool* reset) {
     size_t n = 0;
     portENTER_CRITICAL(&_mux);
+    if (!_buf || !_cap) { portEXIT_CRITICAL(&_mux); *next = from; *reset = false; return 0; }   // captura ainda não iniciada
     uint32_t t = _total;
     uint32_t st = (t > _cap) ? t - (uint32_t)_cap : 0;
     *reset = (from > t);
@@ -60,6 +67,7 @@ class DebugOut : public Print {
     uint32_t ms = millis();
     int tl = snprintf(ts, sizeof ts, "[%lu.%03lu] ", (unsigned long)(ms / 1000), (unsigned long)(ms % 1000));
     portENTER_CRITICAL(&_mux);
+    if (!_buf || !_cap) { portEXIT_CRITICAL(&_mux); return; }
     for (size_t i = 0; i < n; i++) {
       uint8_t c = b[i];
       if (_bol && c != '\n' && c != '\r') { for (int k = 0; k < tl; k++) put((uint8_t)ts[k]); _bol = false; }

@@ -240,8 +240,7 @@ As rotas HTTP disponíveis são:
 - `GET /` — página web de configuração e OTA;
 - `GET /debug` — monitor de debug com a saída serial em tempo real;
 - `GET /debug/log?since=N` — leitura incremental do histórico serial;
-- `GET /firmware-info` — informações do firmware em execução;
-- `GET /config.json` — configuração sem os valores das senhas;
+- `GET /config.json` — configuração sem os valores das senhas, mais o campo `fw` com a data e hora de compilação do firmware instalado (exibido na seção Firmware da página);
 - `POST /config` — valida e salva a configuração;
 - `POST /update` — grava o firmware enviado.
 

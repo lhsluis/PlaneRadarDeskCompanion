@@ -1280,7 +1280,7 @@ static void buildUI() {
   mkCol(fc, 144, 100, "AERONAVE", &lblType, &lblDesc);
   // altitude | distância, abaixo do modelo da aeronave (ex.: 500 ft | 5.6 NM)
   lblAltDist = mkLabel(fc, F10, C_ACCENT, "");
-  centerIn(lblAltDist, 144, 49, 100, LV_LABEL_LONG_CLIP);
+  centerIn(lblAltDist, 144, 49, 100, LV_LABEL_LONG_SCROLL_CIRCULAR);   // rola em círculo se passar da largura (antes cortava)
   mkBox(fc, 144, 8, 1, 52, 0, 0x1F4047);
 
   // separador + ROTA em linha própria
@@ -1389,8 +1389,11 @@ static void applyUpdates() {
       lv_label_set_text(lblAirline, f.airlineName);                 // vazio quando a API não traz o nome
       lv_label_set_text(lblType, f.type);       lv_label_set_text(lblDesc, f.desc);
       lv_label_set_text(lblOrg, f.org);         lv_label_set_text(lblDst, f.dst);
-      if (f.alt[0] && f.dist[0]) lv_label_set_text_fmt(lblAltDist, "%s | %s", f.alt, f.dist);
-      else                       lv_label_set_text(lblAltDist, f.alt[0] ? f.alt : f.dist);
+      char ad[40];
+      if (f.alt[0] && f.dist[0]) snprintf(ad, sizeof ad, "%s | %s", f.alt, f.dist);
+      else                       snprintf(ad, sizeof ad, "%s", f.alt[0] ? f.alt : f.dist);
+      // só atualiza se o texto mudou: lv_label_set_text() reinicia a rolagem, e isso aconteceria a cada consulta (15 s)
+      if (strcmp(lv_label_get_text(lblAltDist), ad) != 0) lv_label_set_text(lblAltDist, ad);
       lv_label_set_text(lblOrgLine, f.orgLine); lv_label_set_text(lblDstLine, f.dstLine);
       // Logo e silhueta foram escondidos no estado "sem voo". Se a companhia/modelo for o mesmo, não há novo download
       // (a URL não mudou) e nada mais os mostraria de volta: reexibe aqui as imagens já carregadas.
