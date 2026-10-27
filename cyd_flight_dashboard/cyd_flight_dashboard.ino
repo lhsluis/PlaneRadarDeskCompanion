@@ -15,6 +15,13 @@
 #include <ESPmDNS.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>    // watchdog da netTask
+#if __has_include("esp_arduino_version.h")
+#include "esp_arduino_version.h"
+#endif
+#ifndef ESP_ARDUINO_VERSION_MAJOR
+#define ESP_ARDUINO_VERSION_MAJOR 2
+#endif
 #include <time.h>
 #include <ArduinoJson.h>
 #define LV_CONF_INCLUDE_SIMPLE
@@ -262,7 +269,9 @@ static void trimInPlace(char* s) {
 // Faz o parse direto em 'buf' (terminado em NUL) e o DESTRÓI — evita duplicar SVGs grandes na RAM.
 static bool rasterSvgInPlace(char* buf, int box, bool tint, lv_color_t tc, SvgImg& out) {
   out = {nullptr, 0, 0};
+  esp_task_wdt_reset();                                  // parse/raster de SVG grande pode demorar
   NSVGimage* im = nsvgParse(buf, "px", 96.0f);
+  esp_task_wdt_reset();
   if (!im) return false;
   if (im->width <= 0 || im->height <= 0) { nsvgDelete(im); return false; }
   float sc = (float)box / fmaxf(im->width, im->height);
@@ -274,7 +283,9 @@ static bool rasterSvgInPlace(char* buf, int box, bool tint, lv_color_t tc, SvgIm
   if (!rgba || !rs || !px) {
     free(rgba); free(px); if (rs) nsvgDeleteRasterizer(rs); nsvgDelete(im); return false;
   }
+  esp_task_wdt_reset();
   nsvgRasterize(rs, im, 0, 0, sc, rgba, ow, oh, ow * 4);
+  esp_task_wdt_reset();
   for (size_t i = 0; i < (size_t)ow * oh; i++) {
     lv_color_t c = tint ? tc : lv_color_make(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
     uint8_t* d = px + i * LV_IMG_PX_SIZE_ALPHA_BYTE;
@@ -496,6 +507,33 @@ static void pushSil(const SvgImg& s) {
 // =====================================================================
 static uint16_t gHttpReadMs = 8000;     // tempo de leitura do HTTP (maior para imagens: o servidor pode gerar na 1ª vez)
 static bool gHttpTooBig = false;   // true quando o servidor respondeu 200 mas o arquivo excede o limite
+static int gLastNetCode = 0;       // código do último GET JSON (<0 = falha de conexão; o backoff usa)
+static String gDnsSeen[6];         // hosts já resolvidos desde a última conexão (log [dns] uma vez por host)
+static uint8_t gDnsN = 0;
+
+// Diagnóstico de falha de conexão (GET < 0): estado do Wi-Fi e tempo gasto
+static void logNetFail(int code, uint32_t t0) {
+  Serial.printf("[net] GET %d em %u ms: wifi=%d rssi=%d ip=%s gw=%s dns=%s\n", code, (unsigned)(millis() - t0),
+                (int)WiFi.status(), WiFi.RSSI(), WiFi.localIP().toString().c_str(),
+                WiFi.gatewayIP().toString().c_str(), WiFi.dnsIP(0).toString().c_str());
+}
+static String urlHost(const String& url) {
+  int a = url.indexOf("://"); a = a < 0 ? 0 : a + 3;
+  int b = url.indexOf('/', a); if (b < 0) b = url.length();
+  int c = url.indexOf(':', a); if (c >= 0 && c < b) b = c;
+  return url.substring(a, b);
+}
+// Resolve o host da URL na 1ª consulta após cada conexão (gDnsN zera em wifiUp())
+static void dnsCheck(const String& url) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  String h = urlHost(url);
+  for (uint8_t i = 0; i < gDnsN; i++) if (gDnsSeen[i] == h) return;
+  if (gDnsN < 6) gDnsSeen[gDnsN++] = h;
+  IPAddress ip; uint32_t t0 = millis();
+  if (WiFi.hostByName(h.c_str(), ip) == 1)
+    Serial.printf("[dns] %s -> %s (%u ms)\n", h.c_str(), ip.toString().c_str(), (unsigned)(millis() - t0));
+  else Serial.printf("[dns] falhou %s (%u ms)\n", h.c_str(), (unsigned)(millis() - t0));
+}
 static bool httpGet(const String& url, String& out, size_t maxLen) {
   gHttpTooBig = false;
   WiFiClientSecure sc; WiFiClient pc; HTTPClient http;
@@ -505,7 +543,10 @@ static bool httpGet(const String& url, String& out, size_t maxLen) {
   if (url.startsWith("https")) { sc.setInsecure(); ok = http.begin(sc, url); }
   else                         { ok = http.begin(pc, url); }
   if (!ok) return false;
+  dnsCheck(url);
+  uint32_t t0 = millis();
   int code = http.GET();
+  if (code < 0) logNetFail(code, t0);
   Serial.printf("[http] %d  %s  (len=%d, heap=%u)\n", code, url.c_str(), http.getSize(), (unsigned)ESP.getFreeHeap());
   if (code != 200) { http.end(); return false; }
   int sz = http.getSize();
@@ -548,7 +589,10 @@ static bool httpGetBuf(const String& url, uint8_t** out, size_t* outLen, size_t 
   if (url.startsWith("https")) { sc.setInsecure(); ok = http.begin(sc, url); }
   else                         { ok = http.begin(pc, url); }
   if (!ok) return false;
+  dnsCheck(url);
+  uint32_t t0 = millis();
   int code = http.GET();
+  if (code < 0) logNetFail(code, t0);
   int sz = http.getSize();
   Serial.printf("[http] %d  %s  (len=%d, heap=%u, psram=%u)\n", code, url.c_str(), sz,
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
@@ -578,6 +622,7 @@ static bool httpGetBuf(const String& url, uint8_t** out, size_t* outLen, size_t 
     size_t av = st->available();
     if (av) { size_t n = st->readBytes(buf + got, min(av, (size_t)sz - got)); got += n; last = millis(); }
     else vTaskDelay(1);
+    esp_task_wdt_reset();                                // download longo: alimenta o watchdog da netTask
   }
   http.end();
   if (got != (size_t)sz) { Serial.printf("[http] leitura incompleta %u/%d\n", (unsigned)got, sz); free(buf); return false; }
@@ -605,10 +650,13 @@ static bool httpGetJson(const String& url, JsonDocument& doc, const JsonDocument
   http.setReuse(false);
   bool ok = https ? http.begin(sc, url) : http.begin(pc, url);
   if (!ok) return false;
+  dnsCheck(url);
+  uint32_t t0 = millis();
   int code = http.GET();
+  gLastNetCode = code;
   int sz = http.getSize();
   Serial.printf("[http] %d  %s  (len=%d, heap=%u)\n", code, url.c_str(), sz, (unsigned)ESP.getFreeHeap());
-  if (code < 0) { Serial.printf("[http] erro de conexao: %s\n", http.errorToString(code).c_str()); http.end(); return false; }
+  if (code < 0) { logNetFail(code, t0); Serial.printf("[http] erro de conexao: %s\n", http.errorToString(code).c_str()); http.end(); return false; }
   if (code != 200) { http.end(); return false; }
   if (sz > 0 && (size_t)sz > maxLen) {
     Serial.printf("[http] arquivo de %d bytes excede o limite de %u\n", sz, (unsigned)maxLen);
@@ -1164,21 +1212,127 @@ static uint32_t backoffMs(uint32_t fails, uint32_t cfg, uint32_t teto) {
   return d < cap ? d : cap;
 }
 
+// ---------------------------------------------------------------------
+//  Fallback de Wi-Fi: 60 s sem conexão -> wfname/wfpass do param.bak; mais 60 s -> AP de configuração
+// ---------------------------------------------------------------------
+static volatile bool gApMode = false;        // SoftAP ligado (o loop() lê para mostrar "AP ..." no título)
+static uint32_t gWifiDownSince = 0;          // ms desde a queda do STA (0 = conectado)
+static uint32_t gApStopAt = 0;               // AP desliga neste ms (0 = sem prazo; cliente ainda na página)
+static uint32_t gUpSince = 0;                // ms da última conexão STA (janela de retentativa rápida)
+static bool gBakLoaded = false, gHasBak = false;
+static String gBakSsid, gBakPass;
+
+// Chamado quando o STA conecta (setup e reconexões): loga a rede e zera o cache de DNS
+static void wifiUp() {
+  gUpSince = millis(); gDnsN = 0;
+  Serial.printf("[wifi] conectado ip=%s gw=%s dns=%s rssi=%d canal=%d\n", WiFi.localIP().toString().c_str(),
+                WiFi.gatewayIP().toString().c_str(), WiFi.dnsIP(0).toString().c_str(), (int)WiFi.RSSI(), (int)WiFi.channel());
+}
+
+// Retentativa: 2 min após conectar, falha de conexão (code<0) retenta em 5, 10, 20, 40 s... até o backoff normal
+static uint32_t retryMs(uint32_t fails, uint32_t cfg, uint32_t teto, bool connFail) {
+  uint32_t n = backoffMs(fails, cfg, teto);
+  if (connFail && fails && millis() - gUpSince < 120000UL) {
+    uint32_t sh = fails - 1; if (sh > 6) sh = 6;
+    uint32_t f = 5000UL << sh;
+    if (f < n) n = f;
+  }
+  return n;
+}
+
+// Lê wfname/wfpass do param.bak (uma vez). Só vale se for diferente do param.txt. Não altera arquivos.
+static void loadBakWifi() {
+  gBakLoaded = true;
+  String txt = readTextFile("/param.bak"), ssid, pass;
+  int pos = 0;
+  while (pos < (int)txt.length()) {
+    int nl = txt.indexOf('\n', pos); if (nl < 0) nl = txt.length();
+    String line = txt.substring(pos, nl); pos = nl + 1;
+    String k = cfgLineKey(line);
+    line.trim();
+    if (k == "wfname")      { ssid = line.substring(line.indexOf('=') + 1); ssid.trim(); }
+    else if (k == "wfpass") { pass = line.substring(line.indexOf('=') + 1); pass.trim(); }
+  }
+  gHasBak = ssid.length() && (ssid != P.ssid || pass != P.pass);
+  gBakSsid = ssid; gBakPass = pass;
+  Serial.printf("[wifi] param.bak: %s\n", gHasBak ? "credenciais alternativas encontradas" : "sem credenciais alternativas");
+}
+
+// AP+STA: "PlaneRadarCompanion-XXXX" (4 hex finais do MAC). Senha = otapass se >= 8 chars; senão aberto.
+// O WebServer já escuta em todas as interfaces, então a página responde em 192.168.4.1.
+static void apStart() {
+  String id = WiFi.macAddress().substring(12); id.replace(":", "");   // "EE:FF" -> "EEFF"
+  String ssid = "PlaneRadarCompanion-" + id;
+  WiFi.mode(WIFI_AP_STA);
+  if (!WiFi.softAP(ssid.c_str(), P.otaPass.length() >= 8 ? P.otaPass.c_str() : nullptr)) {
+    Serial.println("[wifi] falha ao criar o AP"); return;
+  }
+  gApMode = true;
+  Serial.printf("[wifi] modo AP %s\n", ssid.c_str());
+}
+static void apStop() {
+  WiFi.softAPdisconnect(true);                 // também volta o rádio para WIFI_STA
+  gApMode = false;
+  Serial.println("[wifi] conectado, AP desligado");
+}
+
+// Watchdog da netTask: 60 s (maior que o pior caso de HTTP + SVG). O WDT é global: vale também para o loop().
+static void netWdtConfig() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  esp_task_wdt_config_t cfg;
+  cfg.timeout_ms = 60000; cfg.idle_core_mask = 0; cfg.trigger_panic = true;   // sem monitorar o idle
+  if (esp_task_wdt_reconfigure(&cfg) != ESP_OK) Serial.println("[wdt] reconfigure falhou; seguindo com o padrao");
+#else
+  if (esp_task_wdt_init(60, true) != ESP_OK) Serial.println("[wdt] init falhou; seguindo com o padrao");
+#endif
+}
+
 static void netTask(void*) {
   bool doneF = false, doneW = false;
-  uint32_t lastF = 0, lastW = 0, lastReconnect = 0;
+  uint32_t lastF = 0, lastW = 0;
   uint32_t fIv = P.flightMs, wIv = P.weatherMs;          // intervalo atual de cada fetch (com backoff)
   uint32_t fFail = 0, wFail = 0;                         // falhas seguidas de cada fetch
   uint32_t otaTick = millis(), otaConnMs = 0;            // rollback: ms acumulados com Wi-Fi sem validar
+  uint32_t wifiTry = 0; bool bakLogged = false;          // tentativas da queda atual; log do param.bak
+  uint32_t lastReconnect = millis();                     // setup já esperou o WiFi.begin: 1ª retentativa só após 10 s
+  if (esp_task_wdt_add(NULL) == ESP_OK) Serial.println("[wdt] netTask monitorada (60 s)");
+  else Serial.println("[wdt] netTask nao entrou no watchdog");
   for (;;) {
+    esp_task_wdt_reset();                                // alimenta o watchdog em toda volta (inclusive durante OTA)
     uint32_t tick = millis(), dt = tick - otaTick; otaTick = tick;
     if (gOtaBusy) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }   // não disputa o WiFi durante a atualização
     if (WiFi.status() != WL_CONNECTED) {
+      if (!gWifiDownSince) gWifiDownSince = millis();    // queda detectada agora
+      uint32_t down = millis() - gWifiDownSince;
       fFail = wFail = 0;
       fIv = P.flightMs; wIv = P.weatherMs;               // sem Wi-Fi: backoff volta ao configurado
-      if (millis() - lastReconnect > 10000) { lastReconnect = millis(); WiFi.disconnect(); WiFi.begin(P.ssid.c_str(), P.pass.c_str()); }
+      gApStopAt = 0;                                     // queda: o AP fica no ar até reconectar
+      if (gApMode && WiFi.softAPgetStationNum() > 0) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }   // cliente no AP: não mexe no STA
+      if (millis() - lastReconnect > (gApMode ? 60000UL : 10000UL)) {   // AP sem cliente: tenta a cada 60 s
+        lastReconnect = millis();
+        if (down >= 60000UL && !gBakLoaded) loadBakWifi();
+        bool useBak = false;                             // 60-120 s: param.bak; depois do AP: alterna com o principal
+        if (down >= 60000UL && gHasBak) {
+          useBak = down < 120000UL ? true : ((wifiTry++ & 1) != 0);
+          if (useBak && !bakLogged) { bakLogged = true; Serial.println("[wifi] tentando param.bak"); }
+        }
+        if (down >= 120000UL && !gApMode) apStart();
+        String ssid = useBak ? gBakSsid : P.ssid, pass = useBak ? gBakPass : P.pass;
+        WiFi.disconnect(); WiFi.begin(ssid.c_str(), pass.c_str());
+      }
       vTaskDelay(pdMS_TO_TICKS(500)); continue;
     }
+    if (gWifiDownSince || gApMode) {                     // voltou a conectar: zera a queda e desliga o AP
+      if (gWifiDownSince) wifiUp();
+      gWifiDownSince = 0; wifiTry = 0; bakLogged = false;
+      if (gApMode && !gApStopAt) {
+        if (WiFi.softAPgetStationNum() > 0) {            // cliente na página: mantém o AP 60 s para ver o novo IP
+          gApStopAt = millis() + 60000UL;
+          Serial.printf("[wifi] conectado (%s), AP desliga em 60 s\n", WiFi.localIP().toString().c_str());
+        } else apStop();
+      }
+    }
+    if (gApStopAt && (int32_t)(millis() - gApStopAt) >= 0) { gApStopAt = 0; apStop(); }   // fim dos 60 s
     // firmware novo conectado há 3 min sem nenhum clima/voo válido: volta ao anterior
     if (gOtaPendingVerify && (otaConnMs += dt) > 180000UL) {
       Serial.println("[ota] 3 min conectado sem clima/voo: voltando a versao anterior");
@@ -1189,16 +1343,18 @@ static void netTask(void*) {
     uint32_t now = millis();
     if (!doneW || now - lastW >= wIv) {
       doneW = true; lastW = now;
+      gLastNetCode = 0;
       if (fetchWeather()) { wFail = 0; wIv = P.weatherMs; otaValidateIfPending(); }
-      else { wFail++; wIv = backoffMs(wFail, P.weatherMs, P.weatherMs); Serial.printf("[net] clima falhou, proxima em %lu s\n", (unsigned long)(wIv / 1000)); }
+      else { wFail++; wIv = retryMs(wFail, P.weatherMs, P.weatherMs, gLastNetCode < 0); Serial.printf("[net] clima falhou, proxima em %lu s\n", (unsigned long)(wIv / 1000)); }
     }
     now = millis();
     if (isSleepTime()) {
       doneF = false; fFail = 0; fIv = P.flightMs;        // descanso: backoff zerado, ao acordar começa do configurado
     } else if (!doneF || now - lastF >= fIv) {
       doneF = true; lastF = now;
+      gLastNetCode = 0;
       if (fetchFlight()) { fFail = 0; fIv = P.flightMs; otaValidateIfPending(); }
-      else { fFail++; fIv = backoffMs(fFail, P.flightMs, 300000UL); Serial.printf("[net] voo falhou, proxima em %lu s\n", (unsigned long)(fIv / 1000)); }
+      else { fFail++; fIv = retryMs(fFail, P.flightMs, 300000UL, gLastNetCode < 0); Serial.printf("[net] voo falhou, proxima em %lu s\n", (unsigned long)(fIv / 1000)); }
     }
     vTaskDelay(pdMS_TO_TICKS(200));
   }
@@ -1405,6 +1561,12 @@ static void restoreTitle(const char* txt) {
   lv_label_set_text(lblTitle, pt(txt).c_str());
   ipShowUntil = 0;
 }
+// IP do AP de configuração enquanto gApMode (chamado só pelo loop)
+static void apTitle() {
+  lv_obj_set_style_text_letter_space(lblTitle, 0, 0);
+  lv_label_set_text_fmt(lblTitle, "AP %s", WiFi.softAPIP().toString().c_str());
+  ipShowUntil = 0;
+}
 
 static void setStatus(const char* msg) {
   lv_label_set_text(lblTitle, pt(msg).c_str());
@@ -1436,6 +1598,8 @@ static void setAltDist(const FlightUI& f) {
   else                       snprintf(ad, sizeof ad, "%s", f.alt[0] ? f.alt : f.dist);
   if (strcmp(lv_label_get_text(lblAltDist), ad) != 0) lv_label_set_text(lblAltDist, ad);
 }
+
+static void fadeIn(lv_obj_t* o);            // definido mais abaixo (seção LVGL <-> LovyanGFX)
 
 // ---- aplica dados vindos da rede (roda na thread do LVGL) ----
 static void applyUpdates() {
@@ -1513,6 +1677,7 @@ static void applyUpdates() {
       lv_img_set_zoom(imgLogo, 256);
       lv_obj_clear_flag(imgLogo, LV_OBJ_FLAG_HIDDEN);
       lv_obj_center(imgLogo);
+      fadeIn(imgLogo);
       lv_label_set_text(lblLogoTxt, "");
     } else {
       lv_obj_add_flag(imgLogo, LV_OBJ_FLAG_HIDDEN);       // fallback: texto ICAO
@@ -1528,6 +1693,7 @@ static void applyUpdates() {
       lv_img_set_src(imgSil, &dscSil);
       lv_obj_clear_flag(imgSil, LV_OBJ_FLAG_HIDDEN);
       lv_obj_center(imgSil);
+      fadeIn(imgSil);
     } else {
       lv_obj_add_flag(imgSil, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1540,13 +1706,48 @@ static void applyUpdates() {
 static lv_disp_draw_buf_t drawBuf;
 static lv_disp_drv_t dispDrv;
 
+static volatile bool gPanelOff = false;     // painel em sleep (tft.sleep): o flush não envia pixels
+
 static void flushCb(lv_disp_drv_t* d, const lv_area_t* a, lv_color_t* c) {
+  if (gPanelOff) { lv_disp_flush_ready(d); return; }
   uint32_t w = a->x2 - a->x1 + 1, h = a->y2 - a->y1 + 1;
   tft.startWrite();
   tft.setAddrWindow(a->x1, a->y1, w, h);
   tft.writePixels((lgfx::rgb565_t*)&c->full, w * h);
   tft.endWrite();
   lv_disp_flush_ready(d);
+}
+
+// brilho e sleep do painel: rampa não bloqueante no loop (sem fade se screenbrightness=0)
+static const uint32_t BL_FADE_MS = 1500;
+static void updateBacklight() {
+  static int level = P.brightness;          // brilho atual do backlight
+  static bool panelOff = false;
+  static uint32_t last = millis();
+  uint32_t now = millis(), dt = min(now - last, BL_FADE_MS); last = now;
+  bool sleeping = isSleepTime();
+  if (!sleeping && panelOff) {              // acordou: painel de pé e frame pronto antes de subir o brilho
+    tft.wakeup(); panelOff = false; gPanelOff = false;
+    lv_obj_invalidate(lv_scr_act()); lv_refr_now(NULL);
+  }
+  int target = sleeping ? 0 : P.brightness;
+  if (level != target) {                    // rampa linear até o alvo (entra e sai do descanso)
+    int step = max(1, (int)((uint32_t)P.brightness * dt / BL_FADE_MS));
+    level = level < target ? min(target, level + step) : max(target, level - step);
+    tft.setBrightness(level);
+  }
+  if (sleeping && level == 0 && !panelOff) { tft.sleep(); panelOff = true; gPanelOff = true; }   // apagou: desliga o painel
+}
+
+// fade-in do logo e da silhueta na troca de aeronave (opa 0 -> 255 em 400 ms)
+static void setOpa(void* o, int32_t v) { lv_obj_set_style_opa((lv_obj_t*)o, (lv_opa_t)v, 0); }
+static void fadeIn(lv_obj_t* o) {
+  lv_anim_del(o, setOpa);                   // cancela o fade anterior do mesmo objeto
+  lv_obj_set_style_opa(o, LV_OPA_TRANSP, 0);
+  lv_anim_t a; lv_anim_init(&a);
+  lv_anim_set_var(&a, o); lv_anim_set_exec_cb(&a, setOpa);
+  lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER); lv_anim_set_time(&a, 400);
+  lv_anim_start(&a);
 }
 
 static void fatal(const char* msg) {
@@ -1633,10 +1834,11 @@ void setup() {
 
   setStatus("CONECTANDO WIFI...");
   WiFi.mode(WIFI_STA);
+  gWifiDownSince = millis();                 // contagem do fallback começa no boot (zerada se conectar)
   WiFi.begin(P.ssid.c_str(), P.pass.c_str());
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { lv_timer_handler(); delay(50); }
-  if (WiFi.status() == WL_CONNECTED) { showIpTitle(); lv_timer_handler(); }
+  if (WiFi.status() == WL_CONNECTED) { gWifiDownSince = 0; wifiUp(); showIpTitle(); lv_timer_handler(); }
   else setStatus("WIFI FALHOU (RETENTANDO)");
 
   configTzTime(P.tz.c_str(), "pt.pool.ntp.org", "time.google.com");
@@ -1644,21 +1846,17 @@ void setup() {
   clockCb(nullptr);
 
   startOta();
+  netWdtConfig();                  // watchdog de 60 s para a netTask (ela se registra ao iniciar)
   xTaskCreatePinnedToCore(netTask, "net", 20480, nullptr, 0, nullptr, 0);   // prio 0: divide tempo com a idle task (parse de SVG grande demora)
 
   enableLoopWDT();                 // se o loop() travar por >5 s (ex.: assert do LVGL em while(1)), o aparelho reinicia sozinho
 }
 
 void loop() {
-  lv_timer_handler();
+  uint32_t lvNext = lv_timer_handler();   // única chamada no loop; retorna ms até o próximo timer
   applyUpdates();
-  static bool wasSleeping = false;
   updateSleepState();
-  bool sleeping = isSleepTime();
-  if (sleeping != wasSleeping) {
-    wasSleeping = sleeping;
-    tft.setBrightness(sleeping ? 1 : P.brightness);
-  }
+  updateBacklight();
   // diagnóstico e autorrecuperação de memória (1x por minuto)
   static uint32_t lastMem = 0; static int lowCount = 0;
   if (millis() - lastMem >= 60000) {
@@ -1680,17 +1878,22 @@ void loop() {
     else if (ota == 101)        lv_label_set_text(lblTitle, "REINICIANDO...");
     else if (ota == 102)        lv_label_set_text(lblTitle, "FALHA NA ATUALIZACAO");
   }
-  // volta o título quando o WiFi reconecta
-  static bool wasUp = true;
+  // volta o título quando o WiFi reconecta ou o AP liga/desliga
+  static bool wasUp = true, wasAp = false;
   bool up = WiFi.status() == WL_CONNECTED;
-  if (up != wasUp) {
-    wasUp = up;
+  bool ap = gApMode;
+  if (up != wasUp || ap != wasAp) {
+    wasUp = up; wasAp = ap;
     if (up) showIpTitle();                 // reconectou: mostra o IP por 10 s
-    else    restoreTitle("SEM WIFI");
+    else if (ap) apTitle();                // sem STA, mas o AP de configuração está no ar
+    else restoreTitle("SEM WIFI");
   }
   // fim dos 10 s do IP: volta ao título normal (se não houver atualização OTA em andamento)
   if (ipShowUntil && (int32_t)(millis() - ipShowUntil) >= 0) {
-    if (gOtaPct < 0) restoreTitle("HORÁRIO LOCAL"); else ipShowUntil = 0;
+    if (gOtaPct < 0) { if (ap) apTitle(); else restoreTitle("HORÁRIO LOCAL"); }
+    else ipShowUntil = 0;
   }
-  delay(5);
+  // espera pelo ritmo do LVGL: 1..30 ms, até 100 ms durante o descanso
+  uint32_t wait = min<uint32_t>(max<uint32_t>(lvNext, 1), (isSleepTime() && gPanelOff) ? 100 : 30);   // 100 ms só com o painel já apagado (rampa fica suave)
+  delay(wait);
 }

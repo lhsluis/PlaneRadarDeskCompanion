@@ -16,5 +16,5 @@ otapass=troque_esta_senha
 otahost=planeradarcompanion
 # brilho da tela: screenbrightness aceita inteiros de 0 a 255
 #   0 = tela apagada | 1 = mínimo | 64 = ~25% | 128 = ~50% | 191 = ~75% | 255 = máximo
-# se a linha não existir, o brilho padrão é 255. Durante o sleeptimer o brilho continua em 1.
+# se a linha não existir, o brilho padrão é 255. Durante o sleeptimer a tela é desligada, com transição suave.
 screenbrightness=255

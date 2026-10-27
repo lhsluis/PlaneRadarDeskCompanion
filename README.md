@@ -122,8 +122,10 @@ enquanto a busca não encontra aeronaves. Use a URL **base** em `urlbase` (sem `
 `/api/nearest-aircraft?lat=..&lon=..&dist=..`. Chaves conhecidas: `lat lon dist wfname wfpass wheaterpooling flighpooling urlbase tz screenbrightness sleeptimer wakeuptimer otauser otapass otahost`.
 
 O parâmetro `screenbrightness` define o brilho normal da tela entre `0` e
-`255`. Durante o período de descanso, o firmware reduz o backlight para o
-mínimo e, ao acordar, restaura o valor configurado.
+`255`. Durante o período de descanso, a tela é desligada: o backlight desce
+suavemente (~1,5 s) até apagar e o painel entra em sleep. Ao acordar, o painel é
+reativado e o brilho sobe de volta ao valor configurado, também em ~1,5 s. Com
+`screenbrightness=0` a tela apenas fica apagada, sem transição.
 
 Parâmetros desconhecidos também podem permanecer no arquivo. A página web os
 exibe na seção **Parâmetros adicionais** e permite editá-los ou removê-los sem
@@ -132,7 +134,7 @@ nome sugere segredo (`pass`, `senha`, `key`, `token`, etc.) não têm o valor
 enviado ao navegador.
 
 `sleeptimer` e `wakeuptimer` definem o período de descanso no formato 24 horas (`HH:MM`).
-Durante esse período, a consulta de voos é suspensa e o backlight é reduzido ao mínimo.
+Durante esse período, a consulta de voos é suspensa e a tela é desligada, com transição suave (ver `screenbrightness`).
 O período pode atravessar a meia-noite, por exemplo:
 
 ```ini
@@ -267,18 +269,20 @@ Para acentos de verdade: gere 5 fontes (10, 12, 14, 32, 48 px) com `lv_font_conv
 nomeie `font_ui_10` ... `font_ui_48` e ponha `USE_CUSTOM_FONTS 1`. O fonte do Figma (Manrope) pode ser usada aqui.
 
 ## Como funciona
-- Task de rede (core 0) busca voo a cada `flighpooling` s e clima (Open-Meteo, sem chave) a cada `wheaterpooling` s. Em falha, a 1ª nova tentativa é em 30 s (ou no próprio intervalo, se menor) e o intervalo dobra a cada nova falha, até o teto (voo 5 min; clima o intervalo configurado). Volta ao configurado no sucesso, no descanso e ao reconectar o Wi-Fi.
+- Task de rede (core 0) busca voo a cada `flighpooling` s e clima (Open-Meteo, sem chave) a cada `wheaterpooling` s. Em falha, a 1ª nova tentativa é em 30 s (ou no próprio intervalo, se menor) e o intervalo dobra a cada nova falha, até o teto (voo 5 min; clima o intervalo configurado). Nos primeiros 2 min após conectar o Wi-Fi, falha de conexão (sem resposta do servidor) retenta em 5, 10, 20, 40 s... até o backoff normal. Volta ao configurado no sucesso, no descanso e ao reconectar o Wi-Fi.
 - Aeronaves com `alt_baro` igual a `ground` são ignoradas; altitude e distância aparecem sob o modelo no formato `500 ft | 5.6 NM`.
 - UI (core 1) só aplica os dados prontos — o LVGL nunca é tocado pela task de rede.
 - Logo PNG: só baixa quando a companhia muda; decodificado e reduzido no próprio ESP32 com PNGdec.
 - Silhueta SVG: rasterizada no próprio ESP32 com nanosvg para o tamanho configurado em `ICON_PX`, pintada na cor de destaque. Silhuetas PNG também são reduzidas pelo PNGdec; bitmaps vazios ou inválidos usam a silhueta genérica.
 - `radar.gif` é carregado uma vez em memória, preferencialmente na PSRAM, e o timer da animação é pausado quando o radar não está visível.
 - HTTPS usa `setInsecure()` (sem validar certificado).
+- Fallback de Wi-Fi: sem conexão por 60 s (desde o boot ou desde a última queda), tenta `wfname`/`wfpass` do `param.bak`, se forem diferentes dos do `param.txt` (nenhum arquivo é alterado). Se ainda não conectar por mais 60 s, sobe o AP `PlaneRadarCompanion-XXXX` (XXXX = 4 últimos caracteres hex do MAC), com senha igual ao `otapass` se tiver 8 caracteres ou mais, senão aberto, e segue tentando o Wi-Fi em segundo plano a cada 60 s (não tenta enquanto há cliente na página). Enquanto o AP está no ar, o título mostra `AP 192.168.4.1` e a página fica em `http://192.168.4.1/`. Ao conectar no Wi-Fi, o AP é desligado e o IP aparece no título; se houver cliente na página, o AP fica mais 60 s antes de desligar. O AP só sobe se `otapass` estiver definido.
+- Watchdog: a task de rede tem watchdog de 60 s, alimentado a cada volta, durante as leituras HTTP, a rasterização de SVG e a atualização OTA. Se travar, a placa reinicia (motivo `watchdog de task` no log de boot). O watchdog é único, então o `loop()` também passa a ser vigiado com 60 s (antes 5 s).
 
 ## Limitações conhecidas
 
-- Salvar um Wi-Fi incorreto pela página pode deixar a placa inacessível. Corrija
-  o `param.txt` ou restaure o `param.bak` pelo cartão SD.
+- O AP de configuração só sobe com `otapass` definido. Sem ele, a página e o OTA
+  ficam desligados; e, se o Wi-Fi não conectar, corrija o `param.txt` pelo cartão SD.
 - O parse de SVG muito grande pode demorar vários segundos e manter a task de
   rede ocupada; isso só ocorre quando o modelo da aeronave é trocado.
 - Logos ou silhuetas PNG fora dos limites do PNGdec são substituídos pelo texto
