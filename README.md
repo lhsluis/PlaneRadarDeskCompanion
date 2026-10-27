@@ -230,8 +230,13 @@ Para atualizar o firmware pelo navegador:
    no nome.
 
 Durante a gravação, o progresso aparece no título da tela como
-`ATUALIZANDO xx%` e as buscas de rede são pausadas. Não há rollback
-automático: um binário inválido exige recuperação por USB. Depois de alterar o
+`ATUALIZANDO xx%` e as buscas de rede são pausadas.
+
+**Rollback automático:** o firmware novo só é confirmado depois que a placa
+conecta ao Wi-Fi e obtém clima ou voo. Se ela reiniciar ou travar antes disso,
+ou ficar 3 min conectada sem obter nenhum dado, volta sozinha à versão anterior.
+Se o Wi-Fi não conectar, nada é revertido (pode ser rede fora do ar). A proteção
+vale para OTAs de firmwares que já contêm este recurso. Depois de alterar o
 **Partition Scheme**, a primeira gravação precisa ser feita por USB; as
 atualizações seguintes podem usar OTA.
 
@@ -251,9 +256,9 @@ partição OTA presente). Ele mostra as mensagens que o sketch escreve via
 relatórios de crash. O histórico na placa usa um buffer circular de 32 KB com
 PSRAM ou 8 KB sem PSRAM e é perdido quando a placa reinicia. A página do
 navegador mantém os dados que já recebeu, permite pausar a consulta e baixá-los
-como arquivo `.txt`. A captura só começa depois da sincronização do relógio e
-da conclusão das primeiras consultas de clima e voos; mensagens anteriores
-continuam disponíveis pela Serial USB.
+como arquivo `.txt`. A captura começa já no `setup()`, logo após o `Serial.begin`,
+então o boot e as primeiras consultas (relógio, clima, voos) ficam no histórico.
+Mensagens internas do core ESP32 e crashes não entram.
 
 ## Acentos (Á, ã, ç…)
 As fontes embutidas do LVGL só têm ASCII; por padrão o código remove os acentos ("Sábado" -> "Sabado").
@@ -262,7 +267,7 @@ Para acentos de verdade: gere 5 fontes (10, 12, 14, 32, 48 px) com `lv_font_conv
 nomeie `font_ui_10` ... `font_ui_48` e ponha `USE_CUSTOM_FONTS 1`. O fonte do Figma (Manrope) pode ser usada aqui.
 
 ## Como funciona
-- Task de rede (core 0) busca voo a cada `flighpooling` s e clima (Open-Meteo, sem chave) a cada `wheaterpooling` s.
+- Task de rede (core 0) busca voo a cada `flighpooling` s e clima (Open-Meteo, sem chave) a cada `wheaterpooling` s. Em falha, a 1ª nova tentativa é em 30 s (ou no próprio intervalo, se menor) e o intervalo dobra a cada nova falha, até o teto (voo 5 min; clima o intervalo configurado). Volta ao configurado no sucesso, no descanso e ao reconectar o Wi-Fi.
 - Aeronaves com `alt_baro` igual a `ground` são ignoradas; altitude e distância aparecem sob o modelo no formato `500 ft | 5.6 NM`.
 - UI (core 1) só aplica os dados prontos — o LVGL nunca é tocado pela task de rede.
 - Logo PNG: só baixa quando a companhia muda; decodificado e reduzido no próprio ESP32 com PNGdec.

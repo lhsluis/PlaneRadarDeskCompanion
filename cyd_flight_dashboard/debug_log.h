@@ -13,8 +13,8 @@
 
 class DebugOut : public Print {
  public:
-  // begin() só abre o Serial real: o buffer do debug fica desligado (nada é alocado nem gravado)
-  // até startCapture() ser chamado, para não pesar na inicialização.
+  // begin() só abre o Serial real. setup() chama startCapture() logo em seguida, para pegar o boot.
+  // Buffer alocado uma vez (PSRAM se houver); escrita e leitura protegidas por portMUX.
   void begin(unsigned long baud) { Serial.begin(baud); }
   bool capturing() const { return _buf != nullptr; }
   void startCapture() {

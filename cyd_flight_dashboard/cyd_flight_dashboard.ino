@@ -471,14 +471,6 @@ static Wx wxFromCode(int c) {
 // =====================================================================
 //  Dados compartilhados entre a task de rede e a UI
 // =====================================================================
-struct FlightUI {
-  bool valid;
-  char flight[16], iata[16], airline[8], type[8], desc[48];
-  char org[16], dst[16], orgLine[112], dstLine[112], city[64];
-  char alt[16], dist[16];            // altitude (ft) e distância (NM) já formatadas
-  char airlineName[40];              // flight_info.airline.name
-  bool showLogo, showSil;            // logo/silhueta JÁ carregados para este voo (mesma URL): só reexibir, sem novo download
-};
 static SemaphoreHandle_t gMtx;
 static FlightUI gFlight;  static bool gFlightDirty = false;
 static uint8_t* gPendLogo = nullptr; static size_t gPendLogoLen = 0; static int gPendLogoW = 0, gPendLogoH = 0;
@@ -602,17 +594,63 @@ static bool httpGetImgBuf(const String& url, uint8_t** out, size_t* outLen, size
   return httpGetBuf(url, out, outLen, maxLen);
 }
 
+// GET de JSON filtrado. Cliente local por chamada, sem reuso TLS (o reuso com cliente estático causou PANICO).
+// HTTP/1.1, setReuse(false). Com Content-Length lê direto do stream; sem tamanho (chunked) lê a String, limitada a maxLen.
+static bool httpGetJson(const String& url, JsonDocument& doc, const JsonDocument& filter, size_t maxLen) {
+  bool https = url.startsWith("https");
+  WiFiClientSecure sc; WiFiClient pc; HTTPClient http;
+  if (https) sc.setInsecure();
+  http.setConnectTimeout(6000); http.setTimeout(gHttpReadMs);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setReuse(false);
+  bool ok = https ? http.begin(sc, url) : http.begin(pc, url);
+  if (!ok) return false;
+  int code = http.GET();
+  int sz = http.getSize();
+  Serial.printf("[http] %d  %s  (len=%d, heap=%u)\n", code, url.c_str(), sz, (unsigned)ESP.getFreeHeap());
+  if (code < 0) { Serial.printf("[http] erro de conexao: %s\n", http.errorToString(code).c_str()); http.end(); return false; }
+  if (code != 200) { http.end(); return false; }
+  if (sz > 0 && (size_t)sz > maxLen) {
+    Serial.printf("[http] arquivo de %d bytes excede o limite de %u\n", sz, (unsigned)maxLen);
+    http.end(); return false;
+  }
+  DeserializationError err;
+  if (sz > 0) err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  else {                                                 // chunked/sem tamanho: getStream não decodifica, lê a String
+    String body = http.getString();
+    if (body.length() > maxLen) {
+      Serial.printf("[http] corpo de %u bytes excede o limite de %u\n", (unsigned)body.length(), (unsigned)maxLen);
+      http.end(); return false;
+    }
+    err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  }
+  http.end();
+  if (err) { Serial.printf("JSON invalido: %s (code=%d, sz=%d)\n", err.c_str(), code, sz); return false; }
+  return true;
+}
+
 static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
 
 static String lastLogoUrl, lastSilUrl;
+static String lastAcId;                                // hex|callsign da última aeronave publicada por inteiro ("" = sem voo)
 static bool silLoaded = false;
 
-static void fetchFlight() {
+static bool fetchFlight() {
   String url = P.urlbase + "/api/nearest-aircraft?lat=" + String(P.lat, 6) + "&lon=" + String(P.lon, 6) + "&dist=" + String(P.dist);
-  String body;
-  if (!httpGet(url, body, 32768)) return;              // mantém o último dado na tela
+  JsonDocument flt;                                    // filtro: só os campos lidos abaixo
+  flt["location"]["city"] = true; flt["location"]["principalsubdivision"] = true; flt["location"]["countryname"] = true;
+  flt["aircraft"]["hex"] = true; flt["aircraft"]["flight"] = true; flt["aircraft"]["alt_baro"] = true;
+  flt["aircraft"]["dst"] = true; flt["aircraft"]["t"] = true; flt["aircraft"]["desc"] = true;
+  flt["flight_info"]["callsign_iata"] = true;
+  flt["flight_info"]["airline"]["icao"] = true; flt["flight_info"]["airline"]["name"] = true;
+  for (const char* side : {"origin", "destination"}) {
+    flt["flight_info"][side]["iata_code"] = true; flt["flight_info"][side]["icao_code"] = true;
+    flt["flight_info"][side]["name"] = true; flt["flight_info"][side]["municipality"] = true;
+    flt["flight_info"][side]["country_name"] = true;
+  }
+  flt["airline_logo_small"] = true; flt["airline_logo"] = true; flt["silhouette_png"] = true; flt["silhouette"] = true;
   JsonDocument doc;
-  if (deserializeJson(doc, body)) { Serial.println("JSON invalido"); return; }
+  if (!httpGetJson(url, doc, flt, 32768)) return false; // mantém o último dado na tela
 
   FlightUI f; memset(&f, 0, sizeof f);
 
@@ -634,9 +672,9 @@ static void fetchFlight() {
     ac = JsonObject();
   }
   if (ac.isNull()) {
-    f.valid = false;
+    f.valid = false; lastAcId = "";
     xSemaphoreTake(gMtx, portMAX_DELAY); gFlight = f; gFlightDirty = true; xSemaphoreGive(gMtx);
-    return;
+    return true;
   }
   f.valid = true;
   JsonObject fi  = doc["flight_info"].as<JsonObject>();
@@ -667,6 +705,21 @@ static void fetchFlight() {
     if (dv.is<float>()) snprintf(f.dist, sizeof f.dist, "%.1f NM", dv.as<float>());
   }
 
+  // Logo/silhueta: a URL é o que decide se há download (ver abaixo)
+  String logoUrl = S(doc["airline_logo_small"], S(doc["airline_logo"], ""));   // prefere as versões leves
+  String silUrl  = S(doc["silhouette_png"], S(doc["silhouette"], ""));
+
+  // Mesma aeronave já publicada por inteiro e logo/silhueta resolvidos: publica só altitude/distância
+  String id = String(S(ac["hex"], "")) + "|" + S(ac["flight"], "");
+  if (id.length() > 1 && id == lastAcId && logoUrl == lastLogoUrl && silUrl == lastSilUrl && silLoaded) {
+    xSemaphoreTake(gMtx, portMAX_DELAY);
+    if (!gFlightDirty) gFlight.altOnly = true;        // se um voo completo ainda está pendente na UI, ele continua valendo
+    strlcpy(gFlight.alt, f.alt, sizeof gFlight.alt); strlcpy(gFlight.dist, f.dist, sizeof gFlight.dist);
+    gFlightDirty = true;
+    xSemaphoreGive(gMtx);
+    return true;
+  }
+
   if (org.isNull() || !orgCode[0]) strlcpy(f.orgLine, "Rota desconhecida", sizeof f.orgLine);
   else snprintf(f.orgLine, sizeof f.orgLine, "%s" SEP "%s" SEP "%s" SEP "%s", f.org,
                 S(org["name"], ""), S(org["municipality"], ""), S(org["country_name"], ""));
@@ -677,12 +730,9 @@ static void fetchFlight() {
   plainInPlace(f.flight); plainInPlace(f.iata); plainInPlace(f.desc); plainInPlace(f.airlineName);
   plainInPlace(f.orgLine); plainInPlace(f.dstLine);
 
-  // Prefere as versões leves servidas pela API (se existirem); senão usa os campos originais.
-  String logoUrl = S(doc["airline_logo_small"], S(doc["airline_logo"], ""));
-  String silUrl  = S(doc["silhouette_png"], S(doc["silhouette"], ""));
-
   f.showLogo = logoUrl.length() && logoUrl == lastLogoUrl;        // já temos o bitmap desta URL
   f.showSil  = silLoaded && silUrl == lastSilUrl;
+  lastAcId = id;
   xSemaphoreTake(gMtx, portMAX_DELAY); gFlight = f; gFlightDirty = true; xSemaphoreGive(gMtx);
 
   Serial.printf("[flight] %s | logo=%s | sil=%s | em cache: logo=%d sil=%d\n", f.flight, logoUrl.c_str(), silUrl.c_str(), (int)f.showLogo, (int)f.showSil);
@@ -758,22 +808,26 @@ static void fetchFlight() {
       }
     }
   }
+  return true;
 }
 
-static void fetchWeather() {
+static bool fetchWeather() {
   String url = String("https://api.open-meteo.com/v1/forecast?latitude=") + String(P.lat, 4) +
                "&longitude=" + String(P.lon, 4) + "&current=temperature_2m,weather_code";
-  String body;
-  if (!httpGet(url, body, 8192)) return;
+  JsonDocument flt; flt["current"]["temperature_2m"] = true; flt["current"]["weather_code"] = true;
   JsonDocument doc;
-  if (deserializeJson(doc, body)) return;
+  if (!httpGetJson(url, doc, flt, 8192)) { Serial.println("[wx] falha http/json"); return false; }
   JsonObject c = doc["current"].as<JsonObject>();
-  if (c.isNull()) return;
+  if (c.isNull()) { Serial.println("[wx] sem 'current'"); return false; }
+  float t = c["temperature_2m"].as<float>();               // mantém a casa decimal (ex.: 13.9)
+  int wc = c["weather_code"] | 3;
   xSemaphoreTake(gMtx, portMAX_DELAY);
-  gTemp = c["temperature_2m"].as<float>();                 // mantém a casa decimal (ex.: 13.9)
-  gWxCode = c["weather_code"] | 3;
+  gTemp = t;
+  gWxCode = wc;
   gWxDirty = true;
   xSemaphoreGive(gMtx);
+  Serial.printf("[wx] temp=%.1f code=%d\n", t, wc);
+  return true;
 }
 
 // =====================================================================
@@ -1086,36 +1140,65 @@ static void startOta() {
   xTaskCreatePinnedToCore(otaTask, "ota", 8192, nullptr, 0, nullptr, 0);
 }
 
-// O buffer do debug só é ligado depois que relógio, clima e a 1ª consulta de voos terminaram
-// (ou após 60 s, para o caso de a rede nunca subir), para não impactar a inicialização.
 static char gBootInfo[160] = "";
-static void startDebugWhenReady(bool doneW, bool doneF) {
-  if (DBG.capturing()) return;
-  bool clockOk = time(nullptr) > 1700000000;
-  bool ready = (clockOk && doneW && (doneF || isSleepTime())) || millis() > 60000;
-  if (!ready) return;
-  DBG.startCapture();
-  Serial.print(gBootInfo);                                // mesma linha de boot que sai no Serial
-  Serial.println("[debug] monitor iniciado (apos relogio, clima e 1a consulta de voos)");
+
+// Rollback OTA: o core confirma o app no boot por padrão (verifyRollbackLater() == false). Aqui a
+// confirmação fica com a netTask (após clima/voo); antes disso, reinício/crash volta ao firmware anterior.
+extern "C" bool verifyRollbackLater() { return true; }
+static volatile bool gOtaPendingVerify = false;        // firmware novo aguardando primeiro fetch válido
+
+static void otaValidateIfPending() {
+  if (!gOtaPendingVerify) return;
+  esp_ota_mark_app_valid_cancel_rollback();
+  gOtaPendingVerify = false;
+  Serial.println("[ota] firmware validado");
+}
+
+// Backoff por nº de falhas seguidas: 0 falhas = configurado; 1ª falha = min(configurado, 30 s), dobra a cada
+// nova falha até o teto = max(configurado, teto). Clima: teto = configurado. Voo: teto = 5 min.
+static uint32_t backoffMs(uint32_t fails, uint32_t cfg, uint32_t teto) {
+  if (!fails) return cfg;
+  uint32_t cap = cfg > teto ? cfg : teto;
+  uint32_t d = cfg < 30000UL ? cfg : 30000UL;
+  for (uint32_t i = 1; i < fails && d < cap; i++) d *= 2;
+  return d < cap ? d : cap;
 }
 
 static void netTask(void*) {
   bool doneF = false, doneW = false;
   uint32_t lastF = 0, lastW = 0, lastReconnect = 0;
+  uint32_t fIv = P.flightMs, wIv = P.weatherMs;          // intervalo atual de cada fetch (com backoff)
+  uint32_t fFail = 0, wFail = 0;                         // falhas seguidas de cada fetch
+  uint32_t otaTick = millis(), otaConnMs = 0;            // rollback: ms acumulados com Wi-Fi sem validar
   for (;;) {
+    uint32_t tick = millis(), dt = tick - otaTick; otaTick = tick;
     if (gOtaBusy) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }   // não disputa o WiFi durante a atualização
-    startDebugWhenReady(doneW, doneF);
     if (WiFi.status() != WL_CONNECTED) {
+      fFail = wFail = 0;
+      fIv = P.flightMs; wIv = P.weatherMs;               // sem Wi-Fi: backoff volta ao configurado
       if (millis() - lastReconnect > 10000) { lastReconnect = millis(); WiFi.disconnect(); WiFi.begin(P.ssid.c_str(), P.pass.c_str()); }
       vTaskDelay(pdMS_TO_TICKS(500)); continue;
     }
+    // firmware novo conectado há 3 min sem nenhum clima/voo válido: volta ao anterior
+    if (gOtaPendingVerify && (otaConnMs += dt) > 180000UL) {
+      Serial.println("[ota] 3 min conectado sem clima/voo: voltando a versao anterior");
+      esp_ota_mark_app_invalid_rollback_and_reboot();     // só retorna se o rollback não estiver disponível
+      Serial.println("[ota] rollback indisponivel");
+      otaConnMs = 0;
+    }
     uint32_t now = millis();
-    if (!doneW || now - lastW >= P.weatherMs) { doneW = true; lastW = now; fetchWeather(); }
+    if (!doneW || now - lastW >= wIv) {
+      doneW = true; lastW = now;
+      if (fetchWeather()) { wFail = 0; wIv = P.weatherMs; otaValidateIfPending(); }
+      else { wFail++; wIv = backoffMs(wFail, P.weatherMs, P.weatherMs); Serial.printf("[net] clima falhou, proxima em %lu s\n", (unsigned long)(wIv / 1000)); }
+    }
     now = millis();
     if (isSleepTime()) {
-      doneF = false;
-    } else if (!doneF || now - lastF >= P.flightMs) {
-      doneF = true; lastF = now; fetchFlight();
+      doneF = false; fFail = 0; fIv = P.flightMs;        // descanso: backoff zerado, ao acordar começa do configurado
+    } else if (!doneF || now - lastF >= fIv) {
+      doneF = true; lastF = now;
+      if (fetchFlight()) { fFail = 0; fIv = P.flightMs; otaValidateIfPending(); }
+      else { fFail++; fIv = backoffMs(fFail, P.flightMs, 300000UL); Serial.printf("[net] voo falhou, proxima em %lu s\n", (unsigned long)(fIv / 1000)); }
     }
     vTaskDelay(pdMS_TO_TICKS(200));
   }
@@ -1346,6 +1429,14 @@ static void clockCb(lv_timer_t*) {
   if (n != wxNight) { wxNight = n; lv_img_set_src(imgWx, wxIconFor(wxIc, wxNight)); }
 }
 
+// altitude | distância (só reescreve se mudou: lv_label_set_text() reinicia a rolagem a cada consulta)
+static void setAltDist(const FlightUI& f) {
+  char ad[40];
+  if (f.alt[0] && f.dist[0]) snprintf(ad, sizeof ad, "%s | %s", f.alt, f.dist);
+  else                       snprintf(ad, sizeof ad, "%s", f.alt[0] ? f.alt : f.dist);
+  if (strcmp(lv_label_get_text(lblAltDist), ad) != 0) lv_label_set_text(lblAltDist, ad);
+}
+
 // ---- aplica dados vindos da rede (roda na thread do LVGL) ----
 static void applyUpdates() {
   if (!xSemaphoreTake(gMtx, 0)) return;
@@ -1354,7 +1445,7 @@ static void applyUpdates() {
   FlightUI f; memset(&f, 0, sizeof f); float temp = gTemp; int code = gWxCode;
   uint8_t* logo = nullptr; size_t ln = 0; int lw = 0, lh = 0;
   SvgImg sil = {nullptr, 0, 0};
-  if (fd) { f = gFlight; cur = f; gFlightDirty = false; }
+  if (fd) { f = gFlight; if (!f.altOnly) cur = f; gFlightDirty = false; }
   if (wd) gWxDirty = false;
   if (lc) { logo = gPendLogo; ln = gPendLogoLen; lw = gPendLogoW; lh = gPendLogoH;
             gPendLogo = nullptr; gLogoChanged = false; }
@@ -1371,7 +1462,9 @@ static void applyUpdates() {
     lv_img_set_src(imgWx, wxIconFor(wxIc, wxNight));
   }
 
-  if (fd) {
+  if (fd && f.altOnly) {
+    setAltDist(f);                                          // mesma aeronave: só altitude/distância
+  } else if (fd) {
     if (f.city[0]) lv_label_set_text(lblCity, f.city);      // com ou sem voo
     if (!f.valid) {
       lv_label_set_text(lblFlight, "--");  lv_label_set_text(lblIata, "");  lv_label_set_text(lblAirline, "");
@@ -1389,11 +1482,7 @@ static void applyUpdates() {
       lv_label_set_text(lblAirline, f.airlineName);                 // vazio quando a API não traz o nome
       lv_label_set_text(lblType, f.type);       lv_label_set_text(lblDesc, f.desc);
       lv_label_set_text(lblOrg, f.org);         lv_label_set_text(lblDst, f.dst);
-      char ad[40];
-      if (f.alt[0] && f.dist[0]) snprintf(ad, sizeof ad, "%s | %s", f.alt, f.dist);
-      else                       snprintf(ad, sizeof ad, "%s", f.alt[0] ? f.alt : f.dist);
-      // só atualiza se o texto mudou: lv_label_set_text() reinicia a rolagem, e isso aconteceria a cada consulta (15 s)
-      if (strcmp(lv_label_get_text(lblAltDist), ad) != 0) lv_label_set_text(lblAltDist, ad);
+      setAltDist(f);
       lv_label_set_text(lblOrgLine, f.orgLine); lv_label_set_text(lblDstLine, f.dstLine);
       // Logo e silhueta foram escondidos no estado "sem voo". Se a companhia/modelo for o mesmo, não há novo download
       // (a URL não mudou) e nada mais os mostraria de volta: reexibe aqui as imagens já carregadas.
@@ -1483,8 +1572,17 @@ static const char* resetReasonText(esp_reset_reason_t r) {
 
 void setup() {
   Serial.begin(115200);
+  DBG.startCapture();                                     // buffer do monitor já desde o boot (alocado uma vez)
   snprintf(gBootInfo, sizeof gBootInfo, "\n[boot] firmware de %s %s | motivo do reinicio: %s\n", __DATE__, __TIME__, resetReasonText(esp_reset_reason()));
   Serial.print(gBootInfo);
+  {   // app recém-gravado por OTA ainda não confirmado pelo bootloader
+    esp_ota_img_states_t st;
+    const esp_partition_t* run = esp_ota_get_running_partition();
+    if (run && esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+      gOtaPendingVerify = true;
+      Serial.println("[ota] firmware novo em verificacao");
+    }
+  }
   gMtx = xSemaphoreCreateMutex();
 
   //IF your screen is upsidedown uncoment the line bellow and comment the next one
