@@ -706,6 +706,7 @@ static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | (p[1] <
 static String lastLogoUrl, lastSilUrl;
 static String lastAcId;                                // hex|callsign da última aeronave publicada por inteiro ("" = sem voo)
 static bool silLoaded = false;
+static String silShownUrl;                             // URL a que pertence o bitmap de silhueta enviado à UI ("" = genérica)
 
 static bool fetchFlight() {
   String url = P.urlbase + "/api/nearest-aircraft?lat=" + String(P.lat, 6) + "&lon=" + String(P.lon, 6) + "&dist=" + String(P.dist);
@@ -803,7 +804,7 @@ static bool fetchFlight() {
   plainInPlace(f.orgLine); plainInPlace(f.dstLine);
 
   f.showLogo = logoUrl.length() && logoUrl == lastLogoUrl;        // já temos o bitmap desta URL
-  f.showSil  = silLoaded && silUrl == lastSilUrl;
+  f.showSil  = silLoaded && silUrl == silShownUrl;   // bitmap na UI é o desta URL (ou genérica, se ""), nunca de outra aeronave
   lastAcId = id;
   xSemaphoreTake(gMtx, portMAX_DELAY); gFlight = f; gFlightDirty = true; xSemaphoreGive(gMtx);
 
@@ -870,7 +871,7 @@ static bool fetchFlight() {
       }
       if (!remoteOk) rasterSvg(GENERIC_SIL_SVG, strlen(GENERIC_SIL_SVG), ICON_PX, true, lv_color_hex(C_ACCENT), im);
       pushSil(im);
-      silLoaded = true;
+      silLoaded = true; silShownUrl = silUrl;
       if (remoteOk || !silUrl.length() || tooBig) { lastSilUrl = silUrl; silFails = 0; }
       else {
         silFails++;
@@ -1650,6 +1651,20 @@ static void applyUpdates() {
     lv_img_set_src(imgWx, wxIconFor(wxIc, wxNight));
   }
 
+  if (sc) {                                   // silhueta: antes do voo, pois f.showSil refere-se a este bitmap
+    lv_img_set_src(imgSil, LV_SYMBOL_DUMMY);
+    free(uiSil.data); uiSil = sil;
+    if (sil.data) {
+      fillDsc(dscSil, sil);
+      lv_img_set_src(imgSil, &dscSil);
+      lv_obj_clear_flag(imgSil, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_center(imgSil);
+      fadeIn(imgSil);
+    } else {
+      lv_obj_add_flag(imgSil, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
   if (fd && f.altOnly) {
     setAltDist(f);                                          // mesma aeronave: só altitude/distância
   } else if (fd) {
@@ -1709,19 +1724,6 @@ static void applyUpdates() {
     }
   }
 
-  if (sc) {                                   // silhueta
-    lv_img_set_src(imgSil, LV_SYMBOL_DUMMY);
-    free(uiSil.data); uiSil = sil;
-    if (sil.data) {
-      fillDsc(dscSil, sil);
-      lv_img_set_src(imgSil, &dscSil);
-      lv_obj_clear_flag(imgSil, LV_OBJ_FLAG_HIDDEN);
-      lv_obj_center(imgSil);
-      fadeIn(imgSil);
-    } else {
-      lv_obj_add_flag(imgSil, LV_OBJ_FLAG_HIDDEN);
-    }
-  }
 }
 
 // =====================================================================
