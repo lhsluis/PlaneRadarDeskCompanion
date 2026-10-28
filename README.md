@@ -56,12 +56,24 @@ disponibilizados na pasta `FREENOVE`, junto com o manual do fabricante
 
 ### Arquivos incluídos no sketch
 
-- `nanosvg.h`;
-- `nanosvgrast.h`;
+O `cyd_flight_dashboard.ino` foi dividido em headers incluídos por ele, nesta ordem:
+
+- `config.h`: pinos, fontes, display (LovyanGFX), parâmetros do `param.txt` e helpers de texto;
+- `images.h`: SVG/PNG para imagem LVGL (nanosvg) e ícones de clima;
+- `web.h`: OTA pelo navegador, página de configuração do `param.txt` e debug monitor;
+- `net.h`: dados compartilhados, HTTP, busca de voo/clima, rollback OTA, fallback de Wi-Fi e `netTask`;
+- `ui.h`: UI (LVGL) e ponte LVGL <-> LovyanGFX;
+- `cyd_flight_dashboard.ino`: includes, `setup()` e `loop()`.
+
+Também fazem parte do sketch:
+
 - `dashboard_types.h`;
 - `debug_log.h`;
 - `debug_page.h`;
-- `lv_conf.h`.
+- `ota_page.h`;
+- `lv_conf.h`;
+- `nanosvg.h`;
+- `nanosvgrast.h`.
 
 O Arduino/ESP32 já fornece `WiFi`, `WiFiClientSecure`, `HTTPClient`, `SD_MMC`,
 `SPI`, `time`, `WebServer`, `Update` e `ESPmDNS`; essas APIs não precisam ser
