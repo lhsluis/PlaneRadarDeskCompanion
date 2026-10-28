@@ -69,6 +69,18 @@ static void keepDrop() {
   delete gKeep; gKeep = nullptr; gKeepHost = "";
 }
 
+// Escolhe a sessão: se allow e o host for o do P.urlbase, usa a persistente (pers = true); senão a local 'loc'.
+// Wi-Fi caído ou host diferente do último descarta a persistente antes.
+static HttpSess& pickSess(const String& url, bool allow, HttpSess& loc, bool& pers) {
+  if (WiFi.status() != WL_CONNECTED) keepDrop();      // Wi-Fi caiu: conexão antiga não vale mais
+  String host = urlHost(url);
+  bool keep = allow && host == urlHost(P.urlbase);
+  if (keep && gKeep && gKeepHost != host) keepDrop();  // host diferente do último: recria
+  if (keep && !gKeep) { gKeep = new HttpSess(); gKeepHost = host; }
+  pers = keep && gKeep;
+  return pers ? *gKeep : loc;
+}
+
 // Abre o GET com o cliente passado. Devolve o código (<0 = falha de conexão; 0 = begin falhou).
 // Com 200 e Content-Length acima de maxLen marca gHttpTooBig. Quem chama lê o corpo e chama http.end().
 static int httpOpen(HTTPClient& http, WiFiClientSecure& sc, WiFiClient& pc, const String& url, uint16_t readMs, size_t maxLen, bool reuse) {
@@ -100,50 +112,67 @@ static int httpOpen(HTTPClient& http, WiFiClientSecure& sc, WiFiClient& pc, cons
   return code;
 }
 
+// Imagens em https no host do P.urlbase reusam a conexão persistente; falha (ou corpo não lido) descarta a conexão.
 static bool httpGet(const String& url, String& out, size_t maxLen) {
-  WiFiClientSecure sc; WiFiClient pc; HTTPClient http;
-  int code = httpOpen(http, sc, pc, url, gHttpReadMs, maxLen, false);
+  HttpSess loc; bool pers;
+  HttpSess& s = pickSess(url, url.startsWith("https") && P.urlbase.startsWith("https"), loc, pers);
+  int code = httpOpen(s.http, s.sc, s.pc, url, gHttpReadMs, maxLen, pers);
+  int sz = s.http.getSize();
   bool ok = false;
-  if (code == 200 && !gHttpTooBig) { out = http.getString(); ok = out.length() > 0 && out.length() <= maxLen; }
-  http.end();
+  if (code == 200 && !gHttpTooBig) {
+    out = s.http.getString();
+    ok = out.length() > 0 && out.length() <= maxLen && (sz <= 0 || (int)out.length() == sz);   // leitura curta: conexão suja
+  }
+  s.http.end();
+  if (!ok && pers) keepDrop();
   return ok;
 }
 
 // Baixa para um buffer terminado em NUL, usando PSRAM quando existir (não duplica na RAM).
 // Só funciona com Content-Length conhecido (sem ele, lê a String inteira).
+// Mesma regra de sessão de httpGet (https no host do P.urlbase = persistente).
 static bool httpGetBuf(const String& url, uint8_t** out, size_t* outLen, size_t maxLen) {
   *out = nullptr; *outLen = 0;
-  WiFiClientSecure sc; WiFiClient pc; HTTPClient http;
-  int code = httpOpen(http, sc, pc, url, 10000, maxLen, false);
-  if (code != 200 || gHttpTooBig) { http.end(); return false; }
-  int sz = http.getSize();
-  if (sz <= 0) {                                    // sem Content-Length (resposta em blocos/chunked): getString() decodifica
-    String body = http.getString(); http.end();
-    size_t bl = body.length();
-    if (!bl) return false;
-    if (bl > maxLen) { Serial.printf("[http] arquivo de %u bytes excede o limite de %u\n", (unsigned)bl, (unsigned)maxLen); gHttpTooBig = true; return false; }
-    uint8_t* b = (uint8_t*)heap_caps_malloc(bl + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!b) b = (uint8_t*)malloc(bl + 1);
-    if (!b) { Serial.println("[http] sem memoria para o arquivo"); return false; }
-    memcpy(b, body.c_str(), bl); b[bl] = 0; *out = b; *outLen = bl;
-    Serial.printf("[http] resposta sem Content-Length: %u bytes\n", (unsigned)bl);
-    return true;
+  HttpSess loc; bool pers;
+  HttpSess& s = pickSess(url, url.startsWith("https") && P.urlbase.startsWith("https"), loc, pers);
+  int code = httpOpen(s.http, s.sc, s.pc, url, 10000, maxLen, pers);
+  bool ok = false;
+  if (code == 200 && !gHttpTooBig) {
+    int sz = s.http.getSize();
+    if (sz <= 0) {                                    // sem Content-Length (resposta em blocos/chunked): getString() decodifica
+      String body = s.http.getString();
+      size_t bl = body.length();
+      if (bl > maxLen) { Serial.printf("[http] arquivo de %u bytes excede o limite de %u\n", (unsigned)bl, (unsigned)maxLen); gHttpTooBig = true; }
+      else if (bl) {
+        uint8_t* b = (uint8_t*)heap_caps_malloc(bl + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!b) b = (uint8_t*)malloc(bl + 1);
+        if (!b) Serial.println("[http] sem memoria para o arquivo");
+        else {
+          memcpy(b, body.c_str(), bl); b[bl] = 0; *out = b; *outLen = bl; ok = true;
+          Serial.printf("[http] resposta sem Content-Length: %u bytes\n", (unsigned)bl);
+        }
+      }
+    } else {
+      uint8_t* buf = (uint8_t*)heap_caps_malloc((size_t)sz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!buf) buf = (uint8_t*)malloc((size_t)sz + 1);
+      if (!buf) Serial.println("[http] sem memoria para o arquivo");
+      else {
+        WiFiClient* st = s.http.getStreamPtr();
+        size_t got = 0; uint32_t last = millis();
+        while ((s.http.connected() || st->available()) && got < (size_t)sz && millis() - last < 10000) {
+          size_t av = st->available();
+          if (av) { size_t n = st->readBytes(buf + got, min(av, (size_t)sz - got)); got += n; last = millis(); }
+          else vTaskDelay(1);
+          esp_task_wdt_reset();                        // download longo: alimenta o watchdog da netTask
+        }
+        if (got != (size_t)sz) { Serial.printf("[http] leitura incompleta %u/%d\n", (unsigned)got, sz); free(buf); }
+        else { buf[sz] = 0; *out = buf; *outLen = got; ok = true; }
+      }
+    }
   }
-  uint8_t* buf = (uint8_t*)heap_caps_malloc((size_t)sz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!buf) buf = (uint8_t*)malloc((size_t)sz + 1);
-  if (!buf) { Serial.println("[http] sem memoria para o arquivo"); http.end(); return false; }
-  WiFiClient* st = http.getStreamPtr();
-  size_t got = 0; uint32_t last = millis();
-  while ((http.connected() || st->available()) && got < (size_t)sz && millis() - last < 10000) {
-    size_t av = st->available();
-    if (av) { size_t n = st->readBytes(buf + got, min(av, (size_t)sz - got)); got += n; last = millis(); }
-    else vTaskDelay(1);
-    esp_task_wdt_reset();                                // download longo: alimenta o watchdog da netTask
-  }
-  http.end();
-  if (got != (size_t)sz) { Serial.printf("[http] leitura incompleta %u/%d\n", (unsigned)got, sz); free(buf); return false; }
-  buf[sz] = 0; *out = buf; *outLen = got;
-  return true;
+  s.http.end();
+  if (!ok && pers) keepDrop();                        // falha: corpo não lido ou incompleto, descarta a conexão
+  return ok;
 }
 
 // A API devolve links de imagem em http:// mesmo servindo a API em https://.
@@ -174,14 +203,8 @@ static bool httpGetImgBuf(const String& url, uint8_t** out, size_t* outLen, size
 // outros hosts (ex.: clima) usam cliente local. Qualquer falha descarta a conexão persistente.
 // Com Content-Length lê do stream e drena o resto (conexão limpa para reuso); sem tamanho (chunked) lê a String, limitada a maxLen.
 static bool httpGetJson(const String& url, JsonDocument& doc, const JsonDocument& filter, size_t maxLen) {
-  if (WiFi.status() != WL_CONNECTED) keepDrop();      // Wi-Fi caiu: conexão antiga não vale mais
-  String host = urlHost(url);
-  bool keep = host == urlHost(P.urlbase);
-  if (keep && gKeep && gKeepHost != host) keepDrop();  // host diferente do último: recria
-  if (keep && !gKeep) { gKeep = new HttpSess(); gKeepHost = host; }
-  bool pers = keep && gKeep;
-  HttpSess loc;
-  HttpSess& s = pers ? *gKeep : loc;
+  HttpSess loc; bool pers;
+  HttpSess& s = pickSess(url, true, loc, pers);
   int code = httpOpen(s.http, s.sc, s.pc, url, gHttpReadMs, maxLen, pers);
   gLastNetCode = code;
   int sz = s.http.getSize();

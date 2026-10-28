@@ -284,7 +284,7 @@ nomeie `font_ui_10` ... `font_ui_48` e ponha `USE_CUSTOM_FONTS 1`. O fonte do Fi
 - Task de rede (core 0) busca voo a cada `flighpooling` s e clima (Open-Meteo, sem chave) a cada `wheaterpooling` s. Em falha, a 1ª nova tentativa é em 30 s (ou no próprio intervalo, se menor) e o intervalo dobra a cada nova falha, até o teto (voo 5 min; clima o intervalo configurado). Nos primeiros 2 min após conectar o Wi-Fi, falha de conexão (sem resposta do servidor) retenta em 5, 10, 20, 40 s... até o backoff normal. Volta ao configurado no sucesso, no descanso e ao reconectar o Wi-Fi.
 - Aeronaves com `alt_baro` igual a `ground` são ignoradas; altitude e distância aparecem sob o modelo no formato `500 ft | 5.6 NM`.
 - UI (core 1) só aplica os dados prontos — o LVGL nunca é tocado pela task de rede.
-- Logo PNG: só baixa quando a companhia muda; decodificado e reduzido no próprio ESP32 com PNGdec.
+- Logo PNG: só baixa quando a companhia muda; decodificado e reduzido no próprio ESP32 com PNGdec. Downloads de imagem em https no mesmo host do `urlbase` reusam a conexão persistente (como o JSON); outros hosts ou http usam conexão própria.
 - Silhueta SVG: rasterizada no próprio ESP32 com nanosvg para o tamanho configurado em `ICON_PX`, pintada na cor de destaque. Silhuetas PNG também são reduzidas pelo PNGdec; bitmaps vazios ou inválidos usam a silhueta genérica.
 - `radar.gif` é carregado uma vez em memória, preferencialmente na PSRAM, e o timer da animação é pausado quando o radar não está visível.
 - HTTPS usa `setInsecure()` (sem validar certificado).
