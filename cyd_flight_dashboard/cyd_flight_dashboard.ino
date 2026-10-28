@@ -534,69 +534,67 @@ static void dnsCheck(const String& url) {
     Serial.printf("[dns] %s -> %s (%u ms)\n", h.c_str(), ip.toString().c_str(), (unsigned)(millis() - t0));
   else Serial.printf("[dns] falhou %s (%u ms)\n", h.c_str(), (unsigned)(millis() - t0));
 }
-static bool httpGet(const String& url, String& out, size_t maxLen) {
+// Cliente de uma requisição: https usa WiFiClientSecure (sem CA), http usa WiFiClient.
+// (struct só no corpo das funções: o gerador de protótipos do Arduino não enxerga tipos definidos aqui nas assinaturas)
+struct HttpSess { WiFiClientSecure sc; WiFiClient pc; HTTPClient http; };
+static HttpSess* gKeep = nullptr;      // conexão persistente do P.urlbase (criada sob demanda, nunca global)
+static String gKeepHost;
+
+// Descarta a conexão persistente (falha, troca de host, Wi-Fi caiu)
+static void keepDrop() {
+  if (!gKeep) return;
+  gKeep->http.end(); gKeep->sc.stop(); gKeep->pc.stop();
+  delete gKeep; gKeep = nullptr; gKeepHost = "";
+}
+
+// Abre o GET com o cliente passado. Devolve o código (<0 = falha de conexão; 0 = begin falhou).
+// Com 200 e Content-Length acima de maxLen marca gHttpTooBig. Quem chama lê o corpo e chama http.end().
+static int httpOpen(HTTPClient& http, WiFiClientSecure& sc, WiFiClient& pc, const String& url, uint16_t readMs, size_t maxLen, bool reuse) {
   gHttpTooBig = false;
-  WiFiClientSecure sc; WiFiClient pc; HTTPClient http;
-  http.setConnectTimeout(6000); http.setTimeout(gHttpReadMs);
+  bool https = url.startsWith("https");
+  if (https) sc.setInsecure();
+  http.setConnectTimeout(6000); http.setTimeout(readMs);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  bool ok;
-  if (url.startsWith("https")) { sc.setInsecure(); ok = http.begin(sc, url); }
-  else                         { ok = http.begin(pc, url); }
-  if (!ok) return false;
+  http.setReuse(reuse);
+  bool ok = https ? http.begin(sc, url) : http.begin(pc, url);
+  if (!ok) return 0;
+  bool reused = reuse && (https ? sc.connected() : pc.connected());   // socket ainda aberto do GET anterior
   dnsCheck(url);
   uint32_t t0 = millis();
   int code = http.GET();
-  if (code < 0) logNetFail(code, t0);
-  Serial.printf("[http] %d  %s  (len=%d, heap=%u)\n", code, url.c_str(), http.getSize(), (unsigned)ESP.getFreeHeap());
-  if (code != 200) { http.end(); return false; }
+  uint32_t ms = millis() - t0;
   int sz = http.getSize();
-  if (sz > 0 && (size_t)sz > maxLen) {
-    Serial.printf("[http] arquivo de %d bytes excede o limite de %u\n", sz, (unsigned)maxLen);
-    gHttpTooBig = true; http.end(); return false;
+  Serial.printf("[http] %d  %s  (len=%d, heap=%u, psram=%u, %u ms, reuse=%d)\n", code, url.c_str(), sz,
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(), (unsigned)ms, (int)reused);
+  if (code < 0) {
+    logNetFail(code, t0);
+    Serial.printf("[http] erro de conexao: %s\n", http.errorToString(code).c_str());
+    return code;
   }
-  out = http.getString();
-  http.end();
-  return out.length() > 0 && out.length() <= maxLen;
+  if (code == 200 && sz > 0 && (size_t)sz > maxLen) {
+    Serial.printf("[http] arquivo de %d bytes excede o limite de %u\n", sz, (unsigned)maxLen);
+    gHttpTooBig = true;
+  }
+  return code;
 }
 
-// A API devolve links de imagem em http:// mesmo servindo a API em https://.
-// O HTTPClient não segue redirecionamento http->https com cliente não-seguro; por isso tentamos https primeiro.
-static bool httpGetImg(const String& url, String& out, size_t maxLen) {
-  gHttpReadMs = 10000;                          // imagens: 10 s (antes 8 s; 20 s deixava a netTask bloqueada demais)
-  bool r;
-  if (url.startsWith("http://") && P.urlbase.startsWith("https://")) {
-    String up = "https://" + url.substring(7);
-    r = httpGet(up, out, maxLen);
-    if (!r && !gHttpTooBig) {                   // (se for grande demais, http também não ajuda)
-      Serial.println("[img] https falhou, tentando http original");
-      r = httpGet(url, out, maxLen);
-    }
-  } else {
-    r = httpGet(url, out, maxLen);
-  }
-  gHttpReadMs = 8000;
-  return r;
+static bool httpGet(const String& url, String& out, size_t maxLen) {
+  WiFiClientSecure sc; WiFiClient pc; HTTPClient http;
+  int code = httpOpen(http, sc, pc, url, gHttpReadMs, maxLen, false);
+  bool ok = false;
+  if (code == 200 && !gHttpTooBig) { out = http.getString(); ok = out.length() > 0 && out.length() <= maxLen; }
+  http.end();
+  return ok;
 }
 
 // Baixa para um buffer terminado em NUL, usando PSRAM quando existir (não duplica na RAM).
-// Só funciona com Content-Length conhecido.
+// Só funciona com Content-Length conhecido (sem ele, lê a String inteira).
 static bool httpGetBuf(const String& url, uint8_t** out, size_t* outLen, size_t maxLen) {
-  *out = nullptr; *outLen = 0; gHttpTooBig = false;
+  *out = nullptr; *outLen = 0;
   WiFiClientSecure sc; WiFiClient pc; HTTPClient http;
-  http.setConnectTimeout(6000); http.setTimeout(10000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  bool ok;
-  if (url.startsWith("https")) { sc.setInsecure(); ok = http.begin(sc, url); }
-  else                         { ok = http.begin(pc, url); }
-  if (!ok) return false;
-  dnsCheck(url);
-  uint32_t t0 = millis();
-  int code = http.GET();
-  if (code < 0) logNetFail(code, t0);
+  int code = httpOpen(http, sc, pc, url, 10000, maxLen, false);
+  if (code != 200 || gHttpTooBig) { http.end(); return false; }
   int sz = http.getSize();
-  Serial.printf("[http] %d  %s  (len=%d, heap=%u, psram=%u)\n", code, url.c_str(), sz,
-                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
-  if (code != 200) { http.end(); return false; }
   if (sz <= 0) {                                    // sem Content-Length (resposta em blocos/chunked): getString() decodifica
     String body = http.getString(); http.end();
     size_t bl = body.length();
@@ -608,10 +606,6 @@ static bool httpGetBuf(const String& url, uint8_t** out, size_t* outLen, size_t 
     memcpy(b, body.c_str(), bl); b[bl] = 0; *out = b; *outLen = bl;
     Serial.printf("[http] resposta sem Content-Length: %u bytes\n", (unsigned)bl);
     return true;
-  }
-  if ((size_t)sz > maxLen) {
-    Serial.printf("[http] arquivo de %d bytes excede o limite de %u\n", sz, (unsigned)maxLen);
-    gHttpTooBig = true; http.end(); return false;
   }
   uint8_t* buf = (uint8_t*)heap_caps_malloc((size_t)sz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!buf) buf = (uint8_t*)malloc((size_t)sz + 1);
@@ -629,52 +623,82 @@ static bool httpGetBuf(const String& url, uint8_t** out, size_t* outLen, size_t 
   buf[sz] = 0; *out = buf; *outLen = got;
   return true;
 }
-static bool httpGetImgBuf(const String& url, uint8_t** out, size_t* outLen, size_t maxLen) {
+
+// A API devolve links de imagem em http:// mesmo servindo a API em https://.
+// O HTTPClient não segue redirecionamento http->https com cliente não-seguro; por isso tentamos https primeiro.
+// Usada por httpGetImg (String) e httpGetImgBuf (buffer). Se o https falhar e não for "grande demais", tenta a URL original.
+static bool httpGetImgCore(const String& url, bool useBuf, String* s, uint8_t** b, size_t* bl, size_t maxLen) {
+  auto get = [&](const String& u) { return useBuf ? httpGetBuf(u, b, bl, maxLen) : httpGet(u, *s, maxLen); };
   if (url.startsWith("http://") && P.urlbase.startsWith("https://")) {
-    String up = "https://" + url.substring(7);
-    if (httpGetBuf(up, out, outLen, maxLen)) return true;
-    if (gHttpTooBig) return false;
+    if (get("https://" + url.substring(7))) return true;
+    if (gHttpTooBig) return false;                // (se for grande demais, http também não ajuda)
     Serial.println("[img] https falhou, tentando http original");
   }
-  return httpGetBuf(url, out, outLen, maxLen);
+  return get(url);
 }
 
-// GET de JSON filtrado. Cliente local por chamada, sem reuso TLS (o reuso com cliente estático causou PANICO).
-// HTTP/1.1, setReuse(false). Com Content-Length lê direto do stream; sem tamanho (chunked) lê a String, limitada a maxLen.
+static bool httpGetImg(const String& url, String& out, size_t maxLen) {
+  gHttpReadMs = 10000;                          // imagens: 10 s (antes 8 s; 20 s deixava a netTask bloqueada demais)
+  bool r = httpGetImgCore(url, false, &out, nullptr, nullptr, maxLen);
+  gHttpReadMs = 8000;
+  return r;
+}
+
+static bool httpGetImgBuf(const String& url, uint8_t** out, size_t* outLen, size_t maxLen) {
+  return httpGetImgCore(url, true, nullptr, out, outLen, maxLen);
+}
+
+// GET de JSON filtrado. Hosts do P.urlbase reusam conexão persistente (keep-alive, TLS mantido entre as buscas);
+// outros hosts (ex.: clima) usam cliente local. Qualquer falha descarta a conexão persistente.
+// Com Content-Length lê do stream e drena o resto (conexão limpa para reuso); sem tamanho (chunked) lê a String, limitada a maxLen.
 static bool httpGetJson(const String& url, JsonDocument& doc, const JsonDocument& filter, size_t maxLen) {
-  bool https = url.startsWith("https");
-  WiFiClientSecure sc; WiFiClient pc; HTTPClient http;
-  if (https) sc.setInsecure();
-  http.setConnectTimeout(6000); http.setTimeout(gHttpReadMs);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setReuse(false);
-  bool ok = https ? http.begin(sc, url) : http.begin(pc, url);
-  if (!ok) return false;
-  dnsCheck(url);
-  uint32_t t0 = millis();
-  int code = http.GET();
+  if (WiFi.status() != WL_CONNECTED) keepDrop();      // Wi-Fi caiu: conexão antiga não vale mais
+  String host = urlHost(url);
+  bool keep = host == urlHost(P.urlbase);
+  if (keep && gKeep && gKeepHost != host) keepDrop();  // host diferente do último: recria
+  if (keep && !gKeep) { gKeep = new HttpSess(); gKeepHost = host; }
+  bool pers = keep && gKeep;
+  HttpSess loc;
+  HttpSess& s = pers ? *gKeep : loc;
+  int code = httpOpen(s.http, s.sc, s.pc, url, gHttpReadMs, maxLen, pers);
   gLastNetCode = code;
-  int sz = http.getSize();
-  Serial.printf("[http] %d  %s  (len=%d, heap=%u)\n", code, url.c_str(), sz, (unsigned)ESP.getFreeHeap());
-  if (code < 0) { logNetFail(code, t0); Serial.printf("[http] erro de conexao: %s\n", http.errorToString(code).c_str()); http.end(); return false; }
-  if (code != 200) { http.end(); return false; }
-  if (sz > 0 && (size_t)sz > maxLen) {
-    Serial.printf("[http] arquivo de %d bytes excede o limite de %u\n", sz, (unsigned)maxLen);
-    http.end(); return false;
-  }
-  DeserializationError err;
-  if (sz > 0) err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-  else {                                                 // chunked/sem tamanho: getStream não decodifica, lê a String
-    String body = http.getString();
-    if (body.length() > maxLen) {
-      Serial.printf("[http] corpo de %u bytes excede o limite de %u\n", (unsigned)body.length(), (unsigned)maxLen);
-      http.end(); return false;
+  int sz = s.http.getSize();
+  bool ok = false;
+  if (code == 200 && !gHttpTooBig) {
+    DeserializationError err;
+    if (sz > 0) {
+      struct CntStream : Stream {                      // conta os bytes que o ArduinoJson consumiu do stream
+        Stream* in; size_t n = 0;
+        int available() override { return in->available(); }
+        int read() override { int c = in->read(); if (c >= 0) n++; return c; }
+        int peek() override { return in->peek(); }
+        size_t write(uint8_t) override { return 0; }
+      } cs;
+      cs.in = s.http.getStreamPtr();
+      err = deserializeJson(doc, cs, DeserializationOption::Filter(filter));
+      ok = !err;
+      if (ok) {                                        // drena o resto da resposta: conexão fica limpa para o próximo GET
+        uint32_t last = millis(); uint8_t tmp[64];
+        while (cs.n < (size_t)sz && (s.http.connected() || cs.in->available()) && millis() - last < gHttpReadMs) {
+          size_t av = cs.in->available();
+          if (av) {
+            size_t k = cs.in->readBytes(tmp, min(min(av, sizeof tmp), (size_t)sz - cs.n));
+            cs.n += k; last = millis();
+          } else vTaskDelay(1);
+          esp_task_wdt_reset();
+        }
+        if (cs.n != (size_t)sz) { Serial.printf("[http] leitura incompleta %u/%d\n", (unsigned)cs.n, sz); ok = false; }
+      }
+    } else {                                           // chunked/sem tamanho: getString decodifica
+      String body = s.http.getString();
+      if (body.length() > maxLen) Serial.printf("[http] corpo de %u bytes excede o limite de %u\n", (unsigned)body.length(), (unsigned)maxLen);
+      else { err = deserializeJson(doc, body, DeserializationOption::Filter(filter)); ok = !err; }
     }
-    err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+    if (err) Serial.printf("JSON invalido: %s (code=%d, sz=%d)\n", err.c_str(), code, sz);
   }
-  http.end();
-  if (err) { Serial.printf("JSON invalido: %s (code=%d, sz=%d)\n", err.c_str(), code, sz); return false; }
-  return true;
+  s.http.end();
+  if (!ok && pers) keepDrop();                         // falha: fecha e recria na próxima busca
+  return ok;
 }
 
 static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
